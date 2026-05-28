@@ -30,7 +30,21 @@ The plugin uses a tree-sitter-backed parser for:
 The parser is isolated behind `internal/sem`, so the command surface can stay stable
 while the semantic model gets richer.
 
-## Install Locally
+## Install
+
+Install the plugin binary with Go, then copy it into Entire's managed plugin
+directory:
+
+```sh
+go install github.com/suhaanthayyil/entire-sem/cmd/entire-sem@latest
+entire plugin install "$(go env GOPATH)/bin/entire-sem" --force
+entire sem version
+```
+
+If `$(go env GOPATH)/bin` is already on your `PATH`, Entire can also discover
+the binary directly after `go install`.
+
+## Install From Source
 
 ```sh
 git clone https://github.com/suhaanthayyil/entire-sem.git
@@ -39,8 +53,8 @@ mise run build
 entire plugin install ./entire-sem --force
 ```
 
-After installation, `entire sem ...` works anywhere the Entire CLI can find the
-managed plugin.
+After either install path, `entire sem ...` works anywhere the Entire CLI can
+find the managed plugin.
 
 ## Commands
 

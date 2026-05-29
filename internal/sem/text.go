@@ -90,7 +90,7 @@ func shouldUseColor(out io.Writer) bool {
 }
 
 func (s textStyles) title(value string) string {
-	return s.render("1;38;5;214", value)
+	return s.render("1;38;2;251;146;60", value)
 }
 
 func (s textStyles) file(value string) string {

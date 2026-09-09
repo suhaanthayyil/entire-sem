@@ -18232,7 +18232,7 @@ func TestSkipVendoredDirAlwaysExcludesGitDir(t *testing.T) {
 	load := func(content string) ignoreMatcher {
 		t.Helper()
 		var matcher ignoreMatcher
-		if err := matcher.loadContent(content, false); err != nil {
+		if err := matcher.loadContent(content, false, repoIgnoreOrigin(".gitignore")); err != nil {
 			t.Fatal(err)
 		}
 		return matcher

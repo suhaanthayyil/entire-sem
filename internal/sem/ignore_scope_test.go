@@ -41,7 +41,7 @@ func TestNestedIgnoreNegationReincludesUnderItsOwnDirectory(t *testing.T) {
 	// At the repository root there is no directory to supply the missing path,
 	// so a basename-only negation still carries no signal.
 	var root ignoreMatcher
-	if err := root.loadContent("*\n!.keep\n", false); err != nil {
+	if err := root.loadContent("*\n!.keep\n", false, repoIgnoreOrigin(".gitignore")); err != nil {
 		t.Fatal(err)
 	}
 	if root.ReincludesDescendant("vendor") {

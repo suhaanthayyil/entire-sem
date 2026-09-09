@@ -191,7 +191,7 @@ func TestExhaustedSweepIsDisclosedAsAWarning(t *testing.T) {
 	writeFile(t, repo, ".gitignore", "node_modules/\n")
 	writeIgnoredDirTree(t, repo, "node_modules", 200)
 
-	_, warnings, err := worktreeSourceFiles(t.Context(), repo, ignoreMatcher{}, false)
+	_, warnings, err := worktreeSourceFiles(t.Context(), repo, ignoreMatcher{}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestCompleteSweepDisclosesNothing(t *testing.T) {
 	writeFile(t, repo, "src/app.go", "package app\n")
 	writeIgnoredDirTree(t, repo, "node_modules", 50)
 
-	_, warnings, err := worktreeSourceFiles(t.Context(), repo, ignoreMatcher{}, false)
+	_, warnings, err := worktreeSourceFiles(t.Context(), repo, ignoreMatcher{}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

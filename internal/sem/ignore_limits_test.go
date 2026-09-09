@@ -24,7 +24,7 @@ func TestIgnoreRuleLoadingAcceptsBoundaries(t *testing.T) {
 	t.Run("line bytes", func(t *testing.T) {
 		var matcher ignoreMatcher
 		line := strings.Repeat("x", maxIgnoreRuleBytes)
-		if err := matcher.loadContent(line, false); err != nil {
+		if err := matcher.loadContent(line, false, repoIgnoreOrigin(".gitignore")); err != nil {
 			t.Fatalf("exact-line-limit rule was rejected: %v", err)
 		}
 		if matcher.parsedRuleCount != 1 {
@@ -34,13 +34,13 @@ func TestIgnoreRuleLoadingAcceptsBoundaries(t *testing.T) {
 
 	t.Run("cumulative parsed rules", func(t *testing.T) {
 		var matcher ignoreMatcher
-		if err := matcher.loadContent(strings.Repeat("a\n", maxIgnoreParsedRules), false); err != nil {
+		if err := matcher.loadContent(strings.Repeat("a\n", maxIgnoreParsedRules), false, repoIgnoreOrigin(".gitignore")); err != nil {
 			t.Fatalf("exact parsed-rule limit was rejected: %v", err)
 		}
 		if matcher.parsedRuleCount != maxIgnoreParsedRules {
 			t.Fatalf("parsed rule count = %d, want %d", matcher.parsedRuleCount, maxIgnoreParsedRules)
 		}
-		if err := matcher.loadContent("b\n", false); err == nil ||
+		if err := matcher.loadContent("b\n", false, repoIgnoreOrigin(".gitignore")); err == nil ||
 			!strings.Contains(err.Error(), "parsed rules") {
 			t.Fatalf("one cumulative rule over the limit error = %v", err)
 		}

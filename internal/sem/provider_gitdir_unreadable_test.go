@@ -121,7 +121,7 @@ func TestSearchRepositoryNeverIndexesGitDirNamedFromAnUnreadablePointerFile(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, warnings, err := worktreeSourceFiles(t.Context(), repo, ignores, false)
+	_, warnings, err := worktreeSourceFiles(t.Context(), repo, ignores, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestWalkWorktreeFilesWarnsAboutAnUnreadableDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths, warnings, walkErr := walkWorktreeFiles(t.Context(), repo, ignores, nil)
+	paths, warnings, walkErr := walkWorktreeFiles(t.Context(), repo, ignores, nil, nil)
 	if walkErr != nil {
 		t.Fatalf("an unreadable subdirectory must not abort the whole walk: %v", walkErr)
 	}
@@ -361,7 +361,7 @@ func TestWorktreeSourceFilesWarnsAboutAnUnreadableSweepDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, warnings, err := worktreeSourceFiles(t.Context(), repo, ignores, false)
+	_, warnings, err := worktreeSourceFiles(t.Context(), repo, ignores, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

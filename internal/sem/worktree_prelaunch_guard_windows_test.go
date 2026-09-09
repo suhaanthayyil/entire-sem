@@ -20,7 +20,7 @@ func TestGitWorktreeListingFailureThroughJunctionedSubdirectoryWarns(t *testing.
 	windowsJunction(t, filepath.Join(physicalRepo, "nested"), repo)
 	calls := 0
 	paths, warnings, err := worktreeSourceFilesWithLister(
-		t.Context(), repo, ignoreMatcher{}, false,
+		t.Context(), repo, ignoreMatcher{}, false, nil,
 		func(context.Context, string) ([]string, error) {
 			calls++
 			return nil, errors.New("forced worktree listing failure")
@@ -53,7 +53,7 @@ func TestGitWorktreePreflightJunctionFailsClosedBeforeListerOrFallback(t *testin
 
 	calls := 0
 	paths, warnings, err := worktreeSourceFilesWithLister(
-		t.Context(), repo, ignoreMatcher{}, false,
+		t.Context(), repo, ignoreMatcher{}, false, nil,
 		func(context.Context, string) ([]string, error) {
 			calls++
 			return nil, nil
@@ -81,7 +81,7 @@ func TestGitWorktreeFallbackSelectedEarlyCannotBypassJunctionGuard(t *testing.T)
 
 	calls := 0
 	paths, warnings, err := worktreeSourceFilesWithLister(
-		t.Context(), repo, ignoreMatcher{}, false,
+		t.Context(), repo, ignoreMatcher{}, false, nil,
 		func(context.Context, string) ([]string, error) {
 			calls++
 			return nil, nil
@@ -111,7 +111,7 @@ func TestGitWorktreePreflightUsesNoFollowFallbackForDirectorySymlink(t *testing.
 
 	calls := 0
 	paths, warnings, err := worktreeSourceFilesWithLister(
-		t.Context(), repo, ignoreMatcher{}, false,
+		t.Context(), repo, ignoreMatcher{}, false, nil,
 		func(context.Context, string) ([]string, error) {
 			calls++
 			return nil, nil
@@ -145,7 +145,7 @@ func TestGitWorktreePreflightCompatibilityModeSkipsJunctionInNoFollowFallback(t 
 
 	calls := 0
 	paths, warnings, err := worktreeSourceFilesWithLister(
-		t.Context(), repo, ignoreMatcher{}, false,
+		t.Context(), repo, ignoreMatcher{}, false, nil,
 		func(context.Context, string) ([]string, error) {
 			calls++
 			return nil, nil

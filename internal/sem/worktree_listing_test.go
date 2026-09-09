@@ -607,7 +607,7 @@ func TestFilesystemWalkExcludesSubtreeWithUnreadableNestedIgnorePolicy(t *testin
 			if err != nil {
 				t.Fatal(err)
 			}
-			paths, warnings, err := walkWorktreeFiles(t.Context(), repo, ignores, func(string) bool { return false })
+			paths, warnings, err := walkWorktreeFiles(t.Context(), repo, ignores, func(string) bool { return false }, nil)
 			wantIgnorePolicySubtreeExcluded(t, paths, warnings, err, "nested")
 			if !slices.Contains(paths, "root.go") {
 				t.Fatalf("one unreadable nested policy emptied the whole listing: %#v", paths)
@@ -625,7 +625,7 @@ func TestFilesystemWalkPropagatesIgnoreRuleAllowanceErrors(t *testing.T) {
 	writeFile(t, repo, "nested/keep.go", "package sample\n")
 	writeFile(t, repo, "nested/.gitignore", "first-rule\nsecond-rule\n")
 	base := ignoreMatcher{parsedRuleCount: maxIgnoreParsedRules - 1}
-	_, _, err := walkWorktreeFiles(t.Context(), repo, base, func(string) bool { return false })
+	_, _, err := walkWorktreeFiles(t.Context(), repo, base, func(string) bool { return false }, nil)
 	if err == nil || !strings.Contains(err.Error(), "parsed rules") {
 		t.Fatalf("ignore rule allowance error = %v, want a propagated allowance failure", err)
 	}

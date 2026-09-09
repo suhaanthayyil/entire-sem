@@ -307,7 +307,7 @@ func TestAnalyzeGitRangeReportsReincludedVendorTree(t *testing.T) {
 func TestAdmitChangedFilesRewritesIndexCrossings(t *testing.T) {
 	indexed := diffIndexPolicy{ignores: ignoreMatcher{}, vendorRules: ignoreMatcher{}, enabled: true}
 	var ignoredAll ignoreMatcher
-	if err := ignoredAll.loadContent("*\n", false); err != nil {
+	if err := ignoredAll.loadContent("*\n", false, repoIgnoreOrigin(".gitignore")); err != nil {
 		t.Fatal(err)
 	}
 	unindexed := diffIndexPolicy{ignores: ignoredAll, vendorRules: ignoreMatcher{}, enabled: true}

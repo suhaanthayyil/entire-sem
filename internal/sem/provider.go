@@ -474,6 +474,17 @@ type ProviderSnapshotOptions struct {
 	// (see searchSnapshotKey), so a forced rebuild refreshes the same entry every
 	// other reader serves.
 	ForceRebuild bool
+	// trackRepoIgnored opts into the repoIgnoreLedger accounting inside
+	// openSource: without it the ledger stays nil and every ledger method is a
+	// no-op (see repoIgnoreLedger's nil receivers), so no extra directory reads
+	// or nested-.gitignore parsing happen for a caller that never looks at the
+	// result. Only preselectSearchFiles reads sourceContext.repoIgnored today
+	// (into SearchResponse.RepoIgnored); every other prepareSource caller
+	// (snapshot/index/symbol/edge building) discarded the report, yet paid the
+	// walk-into-every-pruned-directory cost of producing it on every open.
+	// Deliberately unexported: it is an internal wiring detail, not a documented
+	// option, and is not part of the cache key (it changes no snapshot content).
+	trackRepoIgnored bool
 	// cachePolicy is an immutable, bounded capture of external ignore inputs.
 	// Cache pipelines set it once and carry it through keying and construction.
 	cachePolicy *capturedIgnorePolicy
@@ -886,6 +897,9 @@ type sourceContext struct {
 	ignores  ignoreMatcher
 	close    func() error
 	warnings []ProviderWarning
+	// repoIgnored reports what the REPOSITORY's own ignore files removed from the
+	// listing Git produced, or nil when they removed nothing.
+	repoIgnored *RepoIgnoreReport
 }
 
 // oversizeAt reports the oversize record for path when the source has one.
@@ -1802,11 +1816,12 @@ func prepareSource(ctx context.Context, repo string, options ProviderSnapshotOpt
 		committedRevision = commit
 	}
 	opened, err := openSource(ctx, absRepo, committedRevision, sourceOptions{
-		ignoreFiles:  options.IgnoreFiles,
-		includeFiles: options.IncludeFiles,
-		cachePolicy:  options.cachePolicy,
-		maxReadBytes: resolveMaxParseBytes(options.MaxParseBytes),
-		maxFiles:     options.MaxFiles,
+		ignoreFiles:      options.IgnoreFiles,
+		includeFiles:     options.IncludeFiles,
+		cachePolicy:      options.cachePolicy,
+		maxReadBytes:     resolveMaxParseBytes(options.MaxParseBytes),
+		maxFiles:         options.MaxFiles,
+		trackRepoIgnored: options.trackRepoIgnored,
 	})
 	if err != nil {
 		return sourceContext{}, err
@@ -1850,17 +1865,18 @@ func prepareSource(ctx context.Context, repo string, options ProviderSnapshotOpt
 		})
 	}
 	return sourceContext{
-		absRepo:    absRepo,
-		key:        key,
-		commit:     commit,
-		tree:       tree,
-		paths:      paths,
-		read:       opened.read,
-		readPrefix: opened.readPrefix,
-		oversize:   opened.oversize,
-		ignores:    opened.ignores,
-		close:      opened.close,
-		warnings:   warnings,
+		absRepo:     absRepo,
+		key:         key,
+		commit:      commit,
+		tree:        tree,
+		paths:       paths,
+		read:        opened.read,
+		readPrefix:  opened.readPrefix,
+		oversize:    opened.oversize,
+		ignores:     opened.ignores,
+		close:       opened.close,
+		warnings:    warnings,
+		repoIgnored: opened.repoIgnored,
 	}, nil
 }
 
@@ -12985,6 +13001,9 @@ type sourceOptions struct {
 	// maxFiles caps how many paths the listing returns. Zero uses the provider
 	// default; negative removes the cap.
 	maxFiles int
+	// trackRepoIgnored opts into building a real repoIgnoreLedger. See
+	// ProviderSnapshotOptions.trackRepoIgnored for why this defaults to off.
+	trackRepoIgnored bool
 }
 
 // openedSource is what openSource resolves: the file list, the per-file readers,
@@ -13001,6 +13020,9 @@ type openedSource struct {
 	prime    func([]string) error
 	close    func() error
 	warnings []ProviderWarning
+	// repoIgnored reports what the REPOSITORY's own ignore files removed from the
+	// listing Git produced, or nil when they removed nothing. See RepoIgnoreReport.
+	repoIgnored *RepoIgnoreReport
 }
 
 // openSource lists the repository's files and returns a per-file content reader
@@ -13041,7 +13063,16 @@ func openSource(ctx context.Context, repo, committedRevision string, options sou
 			return openedSource{}, err
 		}
 		paths = filterVendoredPaths(paths, vendorRules)
-		paths = filterIgnoredPaths(paths, ignores)
+		// Every path in a committed-tree listing is tracked by construction, so
+		// anything the ignore rules drop here is source Git itself would show the
+		// reader. That is precisely the set worth disclosing. A nil ledger (every
+		// caller but search) makes every method below a no-op: see
+		// trackRepoIgnored.
+		var ledger *repoIgnoreLedger
+		if options.trackRepoIgnored {
+			ledger = &repoIgnoreLedger{listingLimit: resolveMaxSourceFiles(options.maxFiles)}
+		}
+		paths = filterIgnoredPaths(paths, ignores, ledger)
 		paths, capWarnings := capSourceFiles(paths, options.maxFiles)
 		warnings := capWarnings
 		treePathPrefix, err := gitutil.RepoPrefix(ctx, repo)
@@ -13135,21 +13166,30 @@ func openSource(ctx context.Context, repo, committedRevision string, options sou
 			return limited.Prime(unsafeTreePaths)
 		}
 		return openedSource{
-			paths:      paths,
-			read:       read,
-			readPrefix: readPrefix,
-			oversize:   oversize,
-			ignores:    ignores,
-			prime:      prime,
-			close:      closeReaders,
-			warnings:   warnings,
+			paths:       paths,
+			read:        read,
+			readPrefix:  readPrefix,
+			oversize:    oversize,
+			ignores:     ignores,
+			prime:       prime,
+			close:       closeReaders,
+			warnings:    warnings,
+			repoIgnored: ledger.report(),
 		}, nil
 	}
 	ignores, err := loadWorktreeIgnoreMatcher(repo, options.ignoreFiles, options.includeFiles)
 	if err != nil {
 		return openedSource{}, err
 	}
-	paths, sweepWarnings, err := worktreeSourceFiles(ctx, repo, ignores, len(options.includeFiles) > 0)
+	// A nil ledger (every caller but search) makes every method below a
+	// no-op, including the pruned-directory walk that would otherwise descend
+	// into an ignored tree just to produce a report nobody reads: see
+	// trackRepoIgnored.
+	var worktreeLedger *repoIgnoreLedger
+	if options.trackRepoIgnored {
+		worktreeLedger = &repoIgnoreLedger{listingLimit: resolveMaxSourceFiles(options.maxFiles)}
+	}
+	paths, sweepWarnings, err := worktreeSourceFiles(ctx, repo, ignores, len(options.includeFiles) > 0, worktreeLedger)
 	if err != nil {
 		return openedSource{}, err
 	}
@@ -13201,7 +13241,14 @@ func openSource(ctx context.Context, repo, committedRevision string, options sou
 		// reports per-file read failures, but make every content read fail closed.
 		// The listing preflight already refuses a persistently execute-only root;
 		// this branch covers permissions changing between listing and reading.
-		return openManuallyConfinedWorktreeSource(repo, paths, ignores, warnings, maxReadBytes), nil
+		// The listing above already ran the ignore rules and filled the ledger,
+		// so the disclosure is owed on this branch exactly as on the one below.
+		// Losing it here would make an unreadable repository root the one place a
+		// repo-controlled exclusion goes unreported, which is the silence this
+		// report exists to close.
+		confined := openManuallyConfinedWorktreeSource(repo, paths, ignores, warnings, maxReadBytes)
+		confined.repoIgnored = worktreeLedger.report()
+		return confined, nil
 	}
 	// Taken once, from the descriptor os.OpenRoot just pinned, and consulted by
 	// every fallback read below. See pinnedRootIdentity.
@@ -13273,8 +13320,9 @@ func openSource(ctx context.Context, repo, committedRevision string, options sou
 		// This field was nil while the working-tree reader held no handle. The root
 		// outlives every closure above, so the caller that closes the source is what
 		// releases it; every consumer already guards for a nil closer.
-		close:    root.Close,
-		warnings: warnings,
+		close:       root.Close,
+		warnings:    warnings,
+		repoIgnored: worktreeLedger.report(),
 	}, nil
 }
 
@@ -16386,7 +16434,18 @@ func (g *gitDirExcluder) descendObserving(queue []string, queued map[string]stru
 			// is exhausted; after exhaustion hiddenEvidence's promotion determines
 			// the result independently of which later entries were not inspected.
 			entries, readErr := opened.ReadDir(256)
-			sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+			// listingOrderKey, not plain Name(): the ledger's position counter is
+			// only meaningful against the order capSourceFiles truncates — the flat
+			// sorted listing — and those two disagree at every directory/file name
+			// collision. `a.go` sorts before `a/hidden.go` in a flat listing ('.' is
+			// below '/'), but a Name()-ordered walk descends into `a/` first, which
+			// both blamed a rule for a path the file cap had already discarded and
+			// silenced a path the rule really did remove. Sorting by the key that
+			// carries the separator makes this depth-first walk visit paths in the
+			// same order the flat listing holds them.
+			sort.Slice(entries, func(i, j int) bool {
+				return listingOrderKey(entries[i]) < listingOrderKey(entries[j])
+			})
 			for _, entry := range entries {
 				if !g.admitSweepEntry() {
 					_ = opened.Close()
@@ -18842,9 +18901,10 @@ func walkWorktreeFilesAfterGitFailure(
 	repo string,
 	ignores ignoreMatcher,
 	dirTracked func(string) bool,
+	ledger *repoIgnoreLedger,
 	cause error,
 ) ([]string, []ProviderWarning, error) {
-	paths, warnings, err := walkWorktreeFiles(ctx, repo, ignores, dirTracked)
+	paths, warnings, err := walkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -18937,8 +18997,8 @@ func repositoryHasGitMetadata(repo string) bool {
 // .gitignore files itself.
 type worktreeFilesLister func(context.Context, string) ([]string, error)
 
-func worktreeSourceFiles(ctx context.Context, repo string, ignores ignoreMatcher, hasIncludeFiles bool) ([]string, []ProviderWarning, error) {
-	return worktreeSourceFilesWithLister(ctx, repo, ignores, hasIncludeFiles, gitutil.ListWorktreeFiles)
+func worktreeSourceFiles(ctx context.Context, repo string, ignores ignoreMatcher, hasIncludeFiles bool, ledger *repoIgnoreLedger) ([]string, []ProviderWarning, error) {
+	return worktreeSourceFilesWithLister(ctx, repo, ignores, hasIncludeFiles, ledger, gitutil.ListWorktreeFiles)
 }
 
 func worktreeSourceFilesWithLister(
@@ -18946,6 +19006,7 @@ func worktreeSourceFilesWithLister(
 	repo string,
 	ignores ignoreMatcher,
 	hasIncludeFiles bool,
+	ledger *repoIgnoreLedger,
 	listWorktreeFiles worktreeFilesLister,
 ) ([]string, []ProviderWarning, error) {
 	if !gitMetadataSafeForSubprocessContext(ctx, repo) {
@@ -18954,7 +19015,7 @@ func worktreeSourceFilesWithLister(
 		// directory as potentially tracked so unsafe metadata cannot cause source
 		// omissions, and the warning reports the Git-only policy that is unavailable.
 		dirTracked := func(string) bool { return true }
-		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, err)
+		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, err)
 	}
 	trackedDirs, trackedErr := trackedDirSet(ctx, repo)
 	if trackedErr != nil {
@@ -18963,10 +19024,10 @@ func worktreeSourceFilesWithLister(
 		}
 		if repositoryHasGitMetadata(repo) {
 			dirTracked := func(string) bool { return true }
-			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, trackedErr)
+			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, trackedErr)
 		}
 		dirTracked := func(string) bool { return false }
-		return walkWorktreeFiles(ctx, repo, ignores, dirTracked)
+		return walkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger)
 	}
 	dirTracked := func(rel string) bool {
 		_, ok := trackedDirs[rel]
@@ -18976,18 +19037,38 @@ func worktreeSourceFilesWithLister(
 		if errors.Is(err, errGitWorktreeFallbackUnsafe) {
 			return nil, nil, err
 		}
-		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, err)
+		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, err)
 	}
 	listed, err := listWorktreeFiles(ctx, repo)
 	if err != nil {
+		// The fallback accounts for its own exclusions: this listing mode narrows
+		// the corpus the same way, so a disclosure that stopped at the Git-backed
+		// path would leave the identical blind spot behind wherever Git cannot
+		// enumerate the tree.
 		if errors.Is(err, gitutil.ErrWorktreeListingTruncated) {
 			return nil, nil, fmt.Errorf("list Git worktree paths: %w", err)
 		}
 		if repositoryHasGitMetadata(repo) {
-			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, err)
+			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, err)
 		}
-		return walkWorktreeFiles(ctx, repo, ignores, dirTracked)
+		return walkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger)
 	}
+	// Git listed the tree, so it has already applied the checkout's own
+	// .git/info/exclude to the only content that list governs — untracked files.
+	// Anything those rules could still match here is TRACKED, which Git never
+	// hides for them, and dropping it would take source out of the corpus with no
+	// disclosure, because the list belongs to the local operator rather than to
+	// the repository.
+	//
+	// That stripped copy is for the FINAL ignore verdict below only. The
+	// vendored-directory heuristic answers a different question — is a path
+	// Git already decided to list one the operator or project means to keep —
+	// and a local `!vendor/mypkg/` in .git/info/exclude is exactly the kind of
+	// rule Git itself used to decide to list that path as untracked in the
+	// first place. Stripping it before it reaches ReincludesDescendant made
+	// vendoredScanPath drop a path Git had just re-included, so vendorRules
+	// below is built from the FULL matcher, local excludes included.
+	finalIgnores := ignores.withoutLocalExcludes()
 	if hasIncludeFiles {
 		// An explicit include file's negations are allowed to reach into ignored
 		// content; nothing else is, so the ignored listing is only ever requested
@@ -18997,7 +19078,7 @@ func worktreeSourceFilesWithLister(
 			return nil, nil, fmt.Errorf("list ignored Git worktree paths for explicit includes: %w", ignoredErr)
 		}
 		for _, rel := range ignored {
-			if ignores.Reincluded(filepath.ToSlash(rel), false) {
+			if finalIgnores.Reincluded(filepath.ToSlash(rel), false) {
 				listed = append(listed, rel)
 			}
 		}
@@ -19005,6 +19086,18 @@ func worktreeSourceFilesWithLister(
 	// The vendored-directory heuristic consults the project's own re-inclusion
 	// rules wherever they live, not only at the root, so a tree the project
 	// deliberately keeps under a vendored-looking name is not dropped.
+	// Sorted BEFORE the ignore decision, because the ledger counts each candidate's
+	// position in the listing this repository would have had with none of its own
+	// ignore rules — and the cap that position is tested against truncates the
+	// SORTED listing (capSourceFiles, below, on the sorted `paths`).
+	//
+	// Arrival order is not sorted order here, twice over. `git ls-files --cached
+	// --others` emits the untracked group before the index group (git 2.54.0), so a
+	// tracked path that sorts first can arrive last; and an include file's
+	// re-included paths are appended after everything git listed. Counting arrival
+	// order therefore both suppressed the disclosure of a lexically-early excluded
+	// path and disclosed a lexically-late one the cap alone had already discarded.
+	sort.Strings(listed)
 	// A .gitignore can itself be ignored while Git still applies its rules to
 	// sibling paths. Enumerate the bounded ignored-ignore stream as policy
 	// evidence instead of assuming every effective rule file appears in listed.
@@ -19095,11 +19188,30 @@ func worktreeSourceFilesWithLister(
 		}
 		// Explicit ignore/include rules still arbitrate: an include file may have
 		// pulled this path back in, and its own rules may then exclude part of
-		// what it re-included.
-		if ignores.Ignored(rel, false) {
+		// what it re-included. That verdict is taken BELOW, against finalIgnores
+		// and after the ledger has counted the candidate — dropping the path here
+		// would hide from the disclosure the very exclusion it exists to report,
+		// and would take the verdict from the matcher that still carries the
+		// checkout's own .git/info/exclude.
+		//
+		// Git lists index entries for files staged as deleted and can list a
+		// symlink; the snapshot reads neither. Eligibility is decided BEFORE the
+		// ledger hears the path, because a disclosure may only name a file the
+		// ignore rules are what removed — a path the snapshot would have discarded
+		// anyway was never in the corpus to hide, and reporting it as hidden is a
+		// claim about the repository that is not true.
+		if kinds[index] != listedPathRegular {
 			continue
 		}
-		if kinds[index] != listedPathRegular {
+		ledger.noteListingCandidate()
+		if finalIgnores.Ignored(rel, false) {
+			// Git's listing already applied the repository's exclude stack to
+			// UNTRACKED content (`--exclude-standard`), so a path that reaches
+			// this line and is dropped here is one Git would still show — a
+			// tracked file, or one an include file reopened. Disclosing those and
+			// nothing else is what keeps the report free of the ordinary
+			// build-output noise every repository gitignores.
+			finalIgnores.noteRepoExclusion(ledger, rel, false)
 			continue
 		}
 		seen[rel] = struct{}{}
@@ -19196,10 +19308,92 @@ func gitSweepRootsFromGit(ctx context.Context, repo string, gitDirs *gitDirExclu
 	return roots, true
 }
 
+// listingOrderWalk walks the tree rooted at root exactly as filepath.WalkDir
+// does — same callback contract, same SkipDir/SkipAll handling, same second call
+// for a directory it cannot read — except for the order in which it visits the
+// entries of a directory.
+//
+// filepath.WalkDir visits them sorted by NAME, which is not the order of the
+// flat path listing this walk produces. A directory `a` sorts before the file
+// `a.go` by name, yet every path inside it sorts after `a.go`, because '.'
+// (0x2E) is below '/' (0x2F). Name order therefore both reaches `a/hidden.go`
+// before `a.go` and reaches `a.go` after everything under `a/`.
+//
+// That matters because the ledger counts each candidate's position as it is
+// visited, and the cap those positions are tested against (capSourceFiles)
+// truncates the SORTED listing. Counting arrival order blamed a committed rule
+// for a path the cap alone had already discarded, and silenced the disclosure of
+// one the rule really did remove — the same two failures that arrival order
+// caused on the Git-backed listing, which is sorted before it is counted.
+//
+// Keying a directory as name+"/" and recursing in that order visits every path
+// in exactly the order sort.Strings puts them in — it is how Git itself orders
+// tree entries — so the position a candidate takes here is the position it holds
+// in the listing the cap truncates.
+func listingOrderWalk(root string, fn fs.WalkDirFunc) error {
+	info, err := os.Lstat(root)
+	if err != nil {
+		err = fn(root, nil, err)
+	} else {
+		err = listingOrderWalkDir(root, fs.FileInfoToDirEntry(info), fn)
+	}
+	if err == filepath.SkipDir || err == filepath.SkipAll {
+		return nil
+	}
+	return err
+}
+
+func listingOrderWalkDir(path string, entry fs.DirEntry, fn fs.WalkDirFunc) error {
+	if err := fn(path, entry, nil); err != nil || !entry.IsDir() {
+		if err == filepath.SkipDir && entry.IsDir() {
+			err = nil
+		}
+		return err
+	}
+	entries, readErr := os.ReadDir(path)
+	if readErr != nil {
+		// Second call, to report the ReadDir error, as filepath.WalkDir does.
+		if err := fn(path, entry, readErr); err != nil {
+			if err == filepath.SkipDir {
+				return nil
+			}
+			return err
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return listingOrderKey(entries[i]) < listingOrderKey(entries[j])
+	})
+	for _, child := range entries {
+		if err := listingOrderWalkDir(filepath.Join(path, child.Name()), child, fn); err != nil {
+			if err == filepath.SkipDir {
+				break
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// listingOrderKey is the sort key that makes a per-directory ordering agree with
+// a flat sort of the full relative paths: a directory contributes only paths
+// prefixed with its name and a separator, so it must be compared with that
+// separator present.
+func listingOrderKey(entry fs.DirEntry) string {
+	if entry.IsDir() {
+		return entry.Name() + "/"
+	}
+	return entry.Name()
+}
+
 // walkWorktreeFiles is the non-git fallback listing. It honours the ignore stack
 // per directory (root .gitignore plus every nested one on the path) so a
 // directory Git cannot enumerate is still filtered the way the project asked.
-func walkWorktreeFiles(ctx context.Context, repo string, ignores ignoreMatcher, dirTracked func(string) bool) ([]string, []ProviderWarning, error) {
+//
+// It records into ledger what a repository-controlled rule Git does not apply —
+// .graphignore — removed. See nestedIgnoreStack.noteRepoExclusion for why that
+// narrower test, and not every ignored path, is what this mode can disclose
+// honestly.
+func walkWorktreeFiles(ctx context.Context, repo string, ignores ignoreMatcher, dirTracked func(string) bool, ledger *repoIgnoreLedger) ([]string, []ProviderWarning, error) {
 	// Every filesystem fallback enters through here, including paths selected
 	// before Git's index listing succeeds. Require the same complete held-root
 	// safety proof so an earlier Git failure cannot bypass mount detection.
@@ -19207,7 +19401,7 @@ func walkWorktreeFiles(ctx context.Context, repo string, ignores ignoreMatcher, 
 		return nil, nil, err
 	}
 	var paths []string
-	warnings, err := visitWalkWorktreeFiles(ctx, repo, ignores, dirTracked, func(rel string) bool {
+	warnings, err := visitWalkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger, func(rel string) bool {
 		paths = append(paths, rel)
 		return true
 	})
@@ -19223,9 +19417,10 @@ func visitWalkWorktreeFiles(
 	repo string,
 	ignores ignoreMatcher,
 	dirTracked func(string) bool,
+	ledger *repoIgnoreLedger,
 	visit func(string) bool,
 ) ([]ProviderWarning, error) {
-	return visitWalkWorktreeFilesWithRawLimit(ctx, repo, ignores, dirTracked, 0, visit)
+	return visitWalkWorktreeFilesWithRawLimit(ctx, repo, ignores, dirTracked, ledger, 0, visit)
 }
 
 var errWorktreeRawPathLimit = errors.New("filesystem worktree raw path limit exceeded")
@@ -19294,6 +19489,7 @@ func visitWalkWorktreeFilesWithRawLimit(
 	repo string,
 	ignores ignoreMatcher,
 	dirTracked func(string) bool,
+	ledger *repoIgnoreLedger,
 	rawPathLimit int,
 	visit func(string) bool,
 ) ([]ProviderWarning, error) {
@@ -19339,13 +19535,14 @@ func visitWalkWorktreeFilesWithRawLimit(
 			}
 			// Enter first: this directory's own .gitignore is part of the evidence
 			// for whether the project re-includes something inside it.
+			// The corpus walk keeps per-directory policy failures visible through
+			// walk warnings; prune accounting instead records an incomplete count.
 			if err := stack.enter(rel); err != nil {
 				// If the directory itself is unreadable, none of its source can be
 				// listed and a nested policy inside it cannot affect a sibling. Keep
 				// the repository available, but disclose the omission and make hidden
 				// pointer evidence fail closed. An unreadable .gitignore inside a
-				// READABLE directory remains a hard error: silently discarding policy
-				// there could admit content the policy excludes.
+				// READABLE directory is handled below by excluding its subtree.
 				if errors.Is(err, fs.ErrPermission) && !stack.directoryReadable(rel) {
 					gitDirs.hiddenEvidence++
 					gitDirs.noteUnreadableWalkDir(rel)
@@ -19384,6 +19581,11 @@ func visitWalkWorktreeFilesWithRawLimit(
 			// prune, so the set of walked FILES is unchanged.
 			if rel != "" && stack.Ignored(rel, true) && !stack.MayIncludeDescendant(rel) {
 				gitDirs.observePrunedSubtree(rel)
+				// Disclose before pruning: skipping this directory means no child of
+				// it ever reaches the per-file noteRepoExclusion below, so a single
+				// `hidden/` line would otherwise remove an entire source tree from
+				// the corpus with nothing recorded at all.
+				stack.notePrunedRepoExclusion(ledger, rel, dirTracked)
 				frames = frames[:len(frames)-1]
 				continue
 			}
@@ -19454,7 +19656,18 @@ func visitWalkWorktreeFilesWithRawLimit(
 			if walkErr != nil {
 				break
 			}
-			sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+			// listingOrderKey, not plain Name(): the ledger's position counter is
+			// only meaningful against the order capSourceFiles truncates — the flat
+			// sorted listing — and the two disagree at every directory/file name
+			// collision. `a.go` sorts before `a/hidden.go` in a flat listing ('.' is
+			// below '/'), but a Name()-ordered walk descends into `a/` first, which
+			// both blamed a rule for a path the file cap had already discarded and
+			// silenced a path the rule really did remove. Sorting by the key that
+			// carries the separator makes this depth-first walk visit paths in the
+			// same order the flat listing holds them.
+			sort.Slice(entries, func(i, j int) bool {
+				return listingOrderKey(entries[i]) < listingOrderKey(entries[j])
+			})
 			frame.entries = entries
 			frame.ready = true
 			continue
@@ -19498,7 +19711,9 @@ func visitWalkWorktreeFilesWithRawLimit(
 		if isVendoredScanFile(rel, name) {
 			continue
 		}
+		ledger.noteListingCandidate()
 		if stack.Ignored(rel, false) {
+			stack.noteRepoExclusion(ledger, rel, false)
 			continue
 		}
 		if rawPathLimit > 0 && len(paths) >= rawPathLimit {
@@ -19546,11 +19761,15 @@ func filterVendoredPaths(paths []string, ignores vendorIgnoreRules) []string {
 	return filtered
 }
 
-func filterIgnoredPaths(paths []string, ignores ignoreMatcher) []string {
+func filterIgnoredPaths(paths []string, ignores ignoreMatcher, ledger *repoIgnoreLedger) []string {
 	filtered := paths[:0]
 	for _, rel := range paths {
 		rel = filepath.ToSlash(rel)
+		// Kept or excluded, this path is one position of the listing this
+		// repository would have had with no ignore rules of its own.
+		ledger.noteListingCandidate()
 		if ignores.Ignored(rel, false) {
+			ignores.noteRepoExclusion(ledger, rel, false)
 			continue
 		}
 		filtered = append(filtered, rel)
@@ -19672,7 +19891,7 @@ func loadHeadNestedIgnoreRules(
 		return nil, err
 	}
 	if present {
-		rootMatcher, err = loadNestedIgnoreMatcher(rootContent, budget)
+		rootMatcher, err = loadNestedIgnoreMatcher(rootContent, budget, repoIgnoreOrigin(labels[0]))
 		if err != nil {
 			return nil, fmt.Errorf("read ignore file %q: %w", ".gitignore", err)
 		}

@@ -124,7 +124,7 @@ func TestSweepInsideExcludedTreeIndexesNothingFromIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, _, err := worktreeSourceFiles(t.Context(), repo, ignoreMatcher{}, false)
+	files, _, err := worktreeSourceFiles(t.Context(), repo, ignoreMatcher{}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

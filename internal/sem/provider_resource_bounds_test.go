@@ -59,7 +59,7 @@ func TestFilesystemWalkReadsMoreThanOneDirectoryBatch(t *testing.T) {
 	for index := 0; index < 300; index++ {
 		writeFile(t, repo, fmt.Sprintf("p-%03d.go", index), "package sample\n")
 	}
-	paths, _, err := walkWorktreeFiles(t.Context(), repo, ignoreMatcher{}, func(string) bool { return false })
+	paths, _, err := walkWorktreeFiles(t.Context(), repo, ignoreMatcher{}, func(string) bool { return false }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

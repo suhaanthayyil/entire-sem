@@ -263,8 +263,18 @@ func TestWorktreeSnapshotAppliesGitInfoExcludeWithoutCaching(t *testing.T) {
 	if hit {
 		t.Fatal("info/exclude edit reused the stale worktree snapshot")
 	}
-	if hasSymbolNamed(second.Symbols, "Alpha") {
-		t.Fatal("snapshot retained a tracked file excluded by info/exclude")
+	// app.go is TRACKED (cacheTestRepo commits it), and Git applies
+	// .git/info/exclude only while discovering UNTRACKED files: with `/app.go` in
+	// info/exclude, `git ls-files --cached --others --exclude-standard` still
+	// lists app.go and `git check-ignore -v app.go` exits 1, i.e. not ignored
+	// (verified against git 2.54.0). Reapplying the operator's local exclude list
+	// on top of Git's own listing deleted tracked source Git would have shown, and
+	// because that list is the operator's rather than the repository's the
+	// deletion carried no disclosure — the file left the corpus in silence. The
+	// snapshot must keep it. info/exclude remains a policy input for untracked
+	// content, which is why the key checks above still hold.
+	if !hasSymbolNamed(second.Symbols, "Alpha") {
+		t.Fatal("snapshot dropped a TRACKED file merely named in info/exclude; git still lists it")
 	}
 
 	third, hit, err := LoadOrBuildProviderSnapshot(t.Context(), repo, "test", options, cacheDir, false)
@@ -274,7 +284,7 @@ func TestWorktreeSnapshotAppliesGitInfoExcludeWithoutCaching(t *testing.T) {
 	if hit {
 		t.Fatal("unchanged info/exclude made the worktree snapshot cacheable")
 	}
-	if hasSymbolNamed(third.Symbols, "Alpha") {
-		t.Fatal("second rebuilt snapshot restored the excluded file")
+	if !hasSymbolNamed(third.Symbols, "Alpha") {
+		t.Fatal("second rebuilt snapshot dropped the tracked file git still lists")
 	}
 }

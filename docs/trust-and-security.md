@@ -282,6 +282,38 @@ symbol structure with no semantic relations. `capabilities --json` reports
 which tier a language is in. Files the parser cannot process emit
 machine-readable partial failures rather than disappearing silently.
 
+## Repository-controlled exclusions are disclosed
+
+`.graphignore`, `.gitignore` and `.git/info/exclude` live in the repository, so
+whoever can commit to it decides part of what the graph sees. One committed line
+naming a tracked source file removes that file from every answer.
+
+`search` therefore reports what those rules removed rather than presenting the
+surviving corpus as the whole of it. When repository-controlled rules exclude
+files Git itself lists, the response carries `repo_ignored` (the count, the ignore
+files responsible, and up to ten of the excluded paths),
+`stats.files_excluded_by_repo_ignore_rules`, and a `W_REPO_IGNORED_SOURCE`
+warning; the text and agent payloads print the count and name the paths. A
+repository that excludes nothing adds nothing.
+
+Exclusions **you** asked for with `--ignore-file` are not reported: they are your
+own instruction, and reporting them back would bury the case that is not.
+
+The count is exact except in two cases, and both say so. When enumerating an
+excluded directory tree hits something it cannot read, `repo_ignored` carries
+`count_incomplete` with the paths responsible and the response carries an
+`E_REPO_IGNORE_UNREADABLE` partial failure. When the excluded tree is larger than
+the accounting enumerates — the walk is bounded so that a committed rule over a
+huge tree cannot hand back the cost the prune saved, on every search — the report
+carries `count_incomplete` and an `E_REPO_IGNORE_COUNT_INCOMPLETE` partial
+failure. Either way the number is known to be a lower bound rather than quietly
+understated.
+
+This is disclosure, not prevention. It tells you that files were removed and
+which ones; it does not tell you whether one of them was the answer to your
+query, and deciding that still means reading the file. Commands other than
+`search` do not yet carry the disclosure.
+
 ## Command-family tree semantics
 
 Interactive queries read the working tree by default and the committed tree

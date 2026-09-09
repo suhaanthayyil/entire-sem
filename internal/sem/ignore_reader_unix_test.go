@@ -23,7 +23,7 @@ func TestIgnoreSurfacesRejectCharacterDevice(t *testing.T) {
 		name string
 		run  func() error
 	}{
-		{"loader", func() error { return matcher.loadRequired(device, false) }},
+		{"loader", func() error { return matcher.loadRequired(device, false, callerIgnoreOrigin("explicit-ignore")) }},
 		{"search key", func() error {
 			_, err := searchSnapshotKey(repo, "repo", "version", "tree", ProviderSnapshotOptions{IgnoreFiles: []string{device}})
 			return err
@@ -54,7 +54,7 @@ func TestIgnoreSurfacesRejectWriterlessFIFOWithoutBlocking(t *testing.T) {
 		name string
 		run  func() error
 	}{
-		{"loader", func() error { return matcher.loadRequired(fifo, false) }},
+		{"loader", func() error { return matcher.loadRequired(fifo, false, callerIgnoreOrigin("explicit-ignore")) }},
 		{"search key", func() error {
 			_, err := searchSnapshotKey(repo, "repo", "version", "tree", ProviderSnapshotOptions{IgnoreFiles: []string{fifo}})
 			return err

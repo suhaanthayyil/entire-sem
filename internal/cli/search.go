@@ -275,33 +275,40 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 		flags.MaxContextBytes = 0
 	}
 	response, err := sem.SearchRepository(ctx, repo, opts.Version, flags.Query, sem.SearchOptions{
-		Worktree:              flags.Worktree,
-		IgnoreFiles:           flags.IgnoreFiles,
-		IncludeFiles:          flags.IncludeFiles,
-		Profile:               profile,
-		TopK:                  flags.TopK,
-		ContextLines:          flags.ContextLines,
-		MaxRegionLines:        flags.MaxRegionLines,
-		MaxSnippetLines:       flags.MaxSnippetLines,
-		MaxRegionsPerFile:     flags.MaxRegionsPerFile,
-		CacheDir:              cacheDir,
-		DisableCache:          flags.DisableCache,
-		MaxIndexedFiles:       flags.MaxIndexedFiles,
-		IndexAllFiles:         flags.IndexAllFiles,
-		MaxContextBytes:       flags.MaxContextBytes,
-		BodyHeadRanks:         flags.BodyHeadRanks,
-		EnclosureContextLines: flags.EnclosureContextLines,
-		HeadWindowLines:       flags.HeadWindowLines,
-		FullUnitTop:           flags.FullUnitTop,
-		EditSiteBodies:        flags.EditSiteBodies,
-		CalleeHop:             flags.CalleeHop,
-		VerifyPrefix:          flags.VerifyPrefix,
-		VerifyPreFixStatus:    flags.VerifyPreFixStatus,
-		IncludeFileOutline:    flags.FileOutline,
-		VerifyExplainCommand:  flags.VerifyExplain,
-		Deep:                  flags.Deep,
-		SingleResolution:      flags.SingleResolution,
-		DocumentResolution:    flags.DocumentResolution,
+		Worktree:          flags.Worktree,
+		IgnoreFiles:       flags.IgnoreFiles,
+		IncludeFiles:      flags.IncludeFiles,
+		Profile:           profile,
+		TopK:              flags.TopK,
+		ContextLines:      flags.ContextLines,
+		MaxRegionLines:    flags.MaxRegionLines,
+		MaxSnippetLines:   flags.MaxSnippetLines,
+		MaxRegionsPerFile: flags.MaxRegionsPerFile,
+		CacheDir:          cacheDir,
+		DisableCache:      flags.DisableCache,
+		MaxIndexedFiles:   flags.MaxIndexedFiles,
+		IndexAllFiles:     flags.IndexAllFiles,
+		MaxContextBytes:   flags.MaxContextBytes,
+		// Only `--format text` renders the disclosure floor (writeTextSearch
+		// below); json, ndjson and agent carry the same exclusion facts as data —
+		// the W_REPO_IGNORED_SOURCE warning and the whole repo_ignored report —
+		// outside the context budget. Charging their ranking for a floor they
+		// never print bought them nothing and, at a tight ceiling, cost them
+		// their only ranked result.
+		OmitsRepoIgnoreDisclosureFloor: flags.Format != "text",
+		BodyHeadRanks:                  flags.BodyHeadRanks,
+		EnclosureContextLines:          flags.EnclosureContextLines,
+		HeadWindowLines:                flags.HeadWindowLines,
+		FullUnitTop:                    flags.FullUnitTop,
+		EditSiteBodies:                 flags.EditSiteBodies,
+		CalleeHop:                      flags.CalleeHop,
+		VerifyPrefix:                   flags.VerifyPrefix,
+		VerifyPreFixStatus:             flags.VerifyPreFixStatus,
+		IncludeFileOutline:             flags.FileOutline,
+		VerifyExplainCommand:           flags.VerifyExplain,
+		Deep:                           flags.Deep,
+		SingleResolution:               flags.SingleResolution,
+		DocumentResolution:             flags.DocumentResolution,
 
 		IncludeContainerMap:   flags.ContainerMap,
 		IncludeSignatureTypes: flags.SignatureTypes,
@@ -533,6 +540,19 @@ func writeNdjsonSearch(out interface{ Write([]byte) (int, error) }, response sem
 		}); err != nil {
 			return err
 		}
+		// The exclusion disclosure leads the stream, ahead of the results, because NDJSON is
+		// consumed a record at a time: a consumer that acts on the first usable result never
+		// reaches a trailing summary, and a disclosure it never reads reproduces exactly the
+		// blind spot this payload exists to close. It is REPEATED on the summary below, so a
+		// consumer that already parses `repo_ignored` there keeps working unchanged.
+		if response.RepoIgnored != nil {
+			if err := encoder.Encode(struct {
+				RecordType string `json:"record_type"`
+				*sem.RepoIgnoreReport
+			}{RecordType: "search_repo_ignored", RepoIgnoreReport: response.RepoIgnored}); err != nil {
+				return err
+			}
+		}
 		// The closed-set warning leads the stream for the same reason it leads the text output: it is
 		// the one record that changes what the patch has to contain.
 		if response.ClosedSet != nil {
@@ -580,6 +600,9 @@ func writeNdjsonSearch(out interface{ Write([]byte) (int, error) }, response sem
 		}
 		if response.CoverageNote != nil {
 			summary["coverage_note"] = response.CoverageNote
+		}
+		if response.RepoIgnored != nil {
+			summary["repo_ignored"] = response.RepoIgnored
 		}
 		// The signature-types block rides on the summary for the same reason the
 		// declaration card does. It was the one optional block with no serializer
@@ -642,6 +665,12 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 	// made once, here, rather than at the dozens of print sites in this function
 	// and in the sem renderers it calls.
 	out = termsafe.NewWriter(out)
+	// ORDER: the forgery notice first, the ignore disclosure second. Both blocks
+	// claim the head of the payload and both keep it -- the forgery notice says the
+	// bytes below may be lying about who wrote them, which a reader must know before
+	// reading any of them, while the disclosure only has to precede the RESULTS. The
+	// notice is a constant that carries no repository bytes, so it is outside the
+	// budget arithmetic the disclosure does below and cannot shrink it.
 	// The literal cluster is quarantined here, well before it is printed, so its verdict can feed
 	// the notice below. It is the one sem block that writes a repository body unprefixed and
 	// verbatim (search_literals.go, --edit-site-bodies), so it needs the same quarantine a ranked
@@ -678,6 +707,62 @@ func writeTextSearch(out interface{ Write([]byte) (int, error) }, response sem.S
 	if forged {
 		if _, err := out.Write(searchForgeryNotice); err != nil {
 			return err
+		}
+	}
+	// FIRST, ahead of every result: what the repository's own ignore rules took out
+	// of the corpus this answer came from. A reader who has already read the ranked
+	// hits has decided the answer is complete, so a disclosure printed after them is
+	// a disclosure nobody acts on.
+	//
+	// This block is repository-controlled (excluded path names, .gitignore/
+	// .graphignore file names, unreadable directory names) and is written here
+	// AHEAD of the ranked results that response.Stats.ResultBytes was already fit
+	// to response.Stats.ContextBudgetBytes for — so it is charged against that
+	// same ceiling rather than added on top of it. What a ceiling too small for it
+	// buys is a SHORTER disclosure, never a missing one (see the floor below); the
+	// JSON channel carries the full, uncapped report regardless
+	// (response.RepoIgnored).
+	if block := sem.RenderRepoIgnoreDisclosure(response.RepoIgnored); len(block) > 0 {
+		budget := response.Stats.ContextBudgetBytes
+		// Charged against the REMAINING headroom, not against the whole ceiling.
+		// The ranked results and the funded blocks were already fitted to this
+		// same budget, so asking only whether the disclosure fits ON ITS OWN
+		// admitted it on top of a payload already at the ceiling -- the rendered
+		// output then exceeded --max-context-bytes by the full block, which is
+		// repository-controlled and so attacker-sized.
+		//
+		// The three terms are the ones validateSearchContextBlockBudget funds
+		// from inside the ceiling (search_blocks.go); keep them in step.
+		funded := response.Stats.ResultBytes + response.Stats.TypeCardBytes + response.Stats.SignatureTypeBytes
+		// DEGRADE, NEVER OMIT. Charging the block against the headroom is right; going
+		// silent when that headroom is gone is not, and it failed in exactly the case
+		// this disclosure exists for. The fitter spends the ceiling down to the last few
+		// bytes (measured end to end: result_bytes 1993 of a 2000-byte ceiling, 3977 of
+		// 4000), so a repository with enough material to answer the query leaves no
+		// headroom — and `--format text` renders no warnings and no fallback marker of
+		// its own, so the ONLY signal that a committed rule removed content disappeared.
+		// The busy repository with many exclusions got the most complete-LOOKING answer.
+		//
+		// The full block still has to fit the headroom, because the repository sizes it.
+		// Under it sits an irreducible floor carrying no repository-controlled bytes at
+		// all — one sentence, one integer, a pointer at the JSON channel — and the floor
+		// is admitted against the CEILING rather than the headroom. That is the trade: a
+		// payload may exceed --max-context-bytes by at most the floor's documented bound,
+		// an amount this repository picks and a caller can budget for, rather than stay
+		// byte-exact by telling a reader a corpus was whole when it was not.
+		//
+		// A ceiling smaller than the floor itself prints nothing: the caller asked for
+		// less room than the shortest honest disclosure needs.
+		if budget > 0 && funded+len(block) > budget {
+			block = sem.RenderRepoIgnoreDisclosureFloor(response.RepoIgnored)
+			if len(block) > budget {
+				block = nil
+			}
+		}
+		if len(block) > 0 {
+			if _, err := out.Write(block); err != nil {
+				return err
+			}
 		}
 	}
 	if notice, _ := searchLowConfidenceNotices(response); len(notice) > 0 {
@@ -1678,11 +1763,41 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 		if len(response.PartialFailures) > 0 {
 			marker = "!D"
 		}
-		combined := []byte(fmt.Sprintf("Index: cache-%s%s\n", cacheState, marker))
-		if len(combined) <= budget {
-			payload = combined
-		} else {
-			payload = []byte(fmt.Sprintf("%s I:%s\n", marker, cacheState))
+		// The exclusion count degrades WITH the marker rather than being dropped
+		// alongside it. This rung synthesizes its own text, so building it from the
+		// marker alone silently discarded the X suffix agentSearchDiagnostics had
+		// already decided was not droppable telemetry — a payload too small for a
+		// ranked location would go back to implying it saw the whole repository. The
+		// rungs are ordered so the count survives wherever it fits at all: the
+		// shorter form that carries it beats the longer one that does not.
+		excluded := ""
+		if response.Stats.RepoIgnoredFiles > 0 {
+			excluded = fmt.Sprintf(" X%d", response.Stats.RepoIgnoredFiles)
+		}
+		candidates := [][]byte{
+			[]byte(fmt.Sprintf("Index: cache-%s%s%s\n", cacheState, marker, excluded)),
+			[]byte(fmt.Sprintf("%s I:%s%s\n", marker, cacheState, excluded)),
+		}
+		if excluded != "" {
+			// The count outlives the cache state, not the other way round. Below the
+			// bytes the pair needs, every remaining rung named the cache state and
+			// dropped the count — so the tightest budgets, which cannot hold a ranked
+			// location either, went back to implying the answer saw the whole
+			// repository. A stale-index marker is telemetry the caller can re-derive
+			// by asking again; a corpus the repository narrowed is not. This rung is
+			// only ever reached when the fuller line does not fit, so no budget that
+			// can afford both is made to choose.
+			candidates = append(candidates, []byte(fmt.Sprintf("%s%s\n", marker, excluded)))
+		}
+		candidates = append(candidates,
+			[]byte(fmt.Sprintf("Index: cache-%s%s\n", cacheState, marker)),
+			[]byte(fmt.Sprintf("%s I:%s\n", marker, cacheState)),
+		)
+		for _, candidate := range candidates {
+			payload = candidate
+			if len(candidate) <= budget {
+				break
+			}
 		}
 	}
 	if len(payload) > budget {
@@ -1777,7 +1892,8 @@ func agentSearchTypeCard(card []sem.TypeCardEntry) []byte {
 }
 
 func agentSearchDiagnostics(response sem.SearchResponse) ([]byte, []byte) {
-	if len(response.Warnings) == 0 && len(response.PartialFailures) == 0 {
+	if len(response.Warnings) == 0 && len(response.PartialFailures) == 0 &&
+		response.Stats.RepoIgnoredFiles == 0 {
 		return nil, nil
 	}
 	languages, files := searchCompletenessCounts(response.Completeness)
@@ -1786,19 +1902,36 @@ func agentSearchDiagnostics(response sem.SearchResponse) ([]byte, []byte) {
 		level = "degraded"
 	}
 	var full bytes.Buffer
-	fmt.Fprintf(&full, "Coverage: %s (%d language%s/%d file%s; %d warning%s; %d partial failure%s)\n",
+	// The excluded count sits inside the file count's own parentheses on purpose.
+	// This line is the payload's claim about how much of the repository the answer
+	// saw; printing "2 files" beside a silently removed third is what let one
+	// committed ignore line narrow a reader's field of view unannounced.
+	fmt.Fprintf(&full, "Coverage: %s (%d language%s/%d file%s%s; %d warning%s; %d partial failure%s)\n",
 		level, languages, pluralSuffix(languages), files, pluralSuffix(files),
+		agentCoverageExcluded(response.Stats.RepoIgnoredFiles),
 		len(response.Warnings), pluralSuffix(len(response.Warnings)),
 		len(response.PartialFailures), pluralSuffix(len(response.PartialFailures)),
 	)
 	const maxAgentDiagnostics = 3
+	// The exclusion disclosure is hoisted into a visible slot before the cap is
+	// applied. It is the only warning whose whole value is the path it names, and
+	// the omitted-diagnostics line replaces that path with a count — "something is
+	// hidden" instead of "internal/auth/auth.go is hidden". Producers put it first
+	// already; hoisting here means no future producer ordering can lose it.
+	warnings := hoistRepoIgnoreDisclosure(response.Warnings)
+	// The same argument on the failure side. The exclusion SHORTFALL is what turns
+	// the coverage line's file count — and the compact form's X<n> — from a fact
+	// into a lower bound, and producers append it after whatever parser failures
+	// the run collected. Three unparseable files were enough to push it past the
+	// cap, leaving a payload that reported a narrowed corpus as if it were whole.
+	failures := hoistRepoIgnoreShortfall(response.PartialFailures)
 	warningsVisible, failuresVisible := agentDiagnosticVisibility(
-		len(response.Warnings), len(response.PartialFailures), maxAgentDiagnostics,
+		len(warnings), len(failures), repoIgnoreShortfallCount(failures), maxAgentDiagnostics,
 	)
-	for _, warning := range response.Warnings[:warningsVisible] {
+	for _, warning := range warnings[:warningsVisible] {
 		fmt.Fprintf(&full, "- warning %s%s\n", warning.Code, agentDiagnosticPath(warning.FilePath))
 	}
-	for _, failure := range response.PartialFailures[:failuresVisible] {
+	for _, failure := range failures[:failuresVisible] {
 		fmt.Fprintf(&full, "- partial %s%s\n", failure.Code, agentDiagnosticPath(failure.FilePath))
 	}
 	visible := warningsVisible + failuresVisible
@@ -1809,20 +1942,119 @@ func agentSearchDiagnostics(response sem.SearchResponse) ([]byte, []byte) {
 	if level == "degraded" {
 		marker = "D"
 	}
-	compact := []byte(fmt.Sprintf("!%s W%d F%d L%d/%d\n",
-		marker, len(response.Warnings), len(response.PartialFailures), languages, files))
+	excluded := ""
+	if response.Stats.RepoIgnoredFiles > 0 {
+		// X is not droppable telemetry: the compact form exists for tight budgets,
+		// and a budget too small for the count is not a reason to let the payload
+		// go back to implying it saw the whole repository.
+		excluded = fmt.Sprintf(" X%d", response.Stats.RepoIgnoredFiles)
+	}
+	compact := []byte(fmt.Sprintf("!%s W%d F%d L%d/%d%s\n",
+		marker, len(response.Warnings), len(response.PartialFailures), languages, files, excluded))
 	return full.Bytes(), compact
 }
 
-func agentDiagnosticVisibility(warnings, failures, limit int) (int, int) {
+// repoIgnoreDisclosureWarning is the code of the warning that names a file the
+// repository's own ignore rules removed from the corpus.
+const repoIgnoreDisclosureWarning = "W_REPO_IGNORED_SOURCE"
+
+// hoistRepoIgnoreDisclosure returns warnings with the exclusion disclosure moved
+// to the front, leaving every other warning in its original order. The input is
+// never mutated.
+func hoistRepoIgnoreDisclosure(warnings []sem.ProviderWarning) []sem.ProviderWarning {
+	index := -1
+	for i, warning := range warnings {
+		if warning.Code == repoIgnoreDisclosureWarning {
+			index = i
+			break
+		}
+	}
+	if index <= 0 {
+		return warnings
+	}
+	hoisted := make([]sem.ProviderWarning, 0, len(warnings))
+	hoisted = append(hoisted, warnings[index])
+	hoisted = append(hoisted, warnings[:index]...)
+	return append(hoisted, warnings[index+1:]...)
+}
+
+// repoIgnoreShortfallPrefix is the code prefix every partial failure that
+// qualifies the exclusion accounting shares (E_REPO_IGNORE_UNREADABLE,
+// E_REPO_IGNORE_COUNT_INCOMPLETE, E_REPO_IGNORE_GIT_UNAVAILABLE).
+//
+// A prefix rather than a list on purpose: the producer and this renderer are in
+// different packages, and a list here would have to be edited every time the
+// producer learns a new way for the count to fall short. A prefix makes the next
+// one visible by construction instead of silently capped away.
+const repoIgnoreShortfallPrefix = "E_REPO_IGNORE_"
+
+// repoIgnoreShortfallCount reports how many failures qualify the exclusion
+// accounting (see repoIgnoreShortfallPrefix). Shared by hoistRepoIgnoreShortfall
+// and agentDiagnosticVisibility so the two agree on exactly what counts as one
+// of these failures.
+func repoIgnoreShortfallCount(failures []sem.PartialFailure) int {
+	count := 0
+	for _, failure := range failures {
+		if strings.HasPrefix(failure.Code, repoIgnoreShortfallPrefix) {
+			count++
+		}
+	}
+	return count
+}
+
+// hoistRepoIgnoreShortfall returns failures with every exclusion-shortfall
+// record moved to the front, each group keeping its original relative order.
+// The input is never mutated.
+func hoistRepoIgnoreShortfall(failures []sem.PartialFailure) []sem.PartialFailure {
+	shortfalls := repoIgnoreShortfallCount(failures)
+	if shortfalls == 0 || shortfalls == len(failures) {
+		return failures
+	}
+	hoisted := make([]sem.PartialFailure, 0, len(failures))
+	for _, failure := range failures {
+		if strings.HasPrefix(failure.Code, repoIgnoreShortfallPrefix) {
+			hoisted = append(hoisted, failure)
+		}
+	}
+	for _, failure := range failures {
+		if !strings.HasPrefix(failure.Code, repoIgnoreShortfallPrefix) {
+			hoisted = append(hoisted, failure)
+		}
+	}
+	return hoisted
+}
+
+// agentCoverageExcluded renders the repository-controlled exclusion count inside
+// the coverage line, or nothing when the repository excluded nothing.
+func agentCoverageExcluded(excluded int) string {
+	if excluded <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(", %d excluded by repo ignore rules", excluded)
+}
+
+// agentDiagnosticVisibility splits maxAgentDiagnostics slots between warnings
+// and failures. requiredFailures is a floor failuresVisible must reach
+// whenever there are at least that many failures: the repo-ignore shortfall
+// failures a single run can emit together (E_REPO_IGNORE_GIT_UNAVAILABLE,
+// E_REPO_IGNORE_COUNT_INCOMPLETE, ...) each qualify the coverage line's X<n>
+// count in a way the others do not stand in for, so showing only one of two
+// leaves that count looking exact when it is actually a lower bound. Callers
+// with no such floor pass 0; at least one failure of any kind is still
+// guaranteed visible whenever one exists, as before this parameter existed.
+func agentDiagnosticVisibility(warnings, failures, requiredFailures, limit int) (int, int) {
 	if limit <= 0 {
 		return 0, 0
 	}
-	warningsVisible := minIntCLI(warnings, limit)
+	if failures > 0 && requiredFailures < 1 {
+		requiredFailures = 1
+	}
+	requiredFailures = minIntCLI(requiredFailures, minIntCLI(failures, limit))
+	warningsVisible := minIntCLI(warnings, limit-requiredFailures)
 	failuresVisible := minIntCLI(failures, limit-warningsVisible)
-	if failures > 0 && failuresVisible == 0 {
-		warningsVisible--
-		failuresVisible = 1
+	if failuresVisible < requiredFailures {
+		failuresVisible = requiredFailures
+		warningsVisible = minIntCLI(warnings, limit-failuresVisible)
 	}
 	return warningsVisible, failuresVisible
 }

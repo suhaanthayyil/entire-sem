@@ -121,12 +121,14 @@ func captureIgnorePolicy(absRepo string, ignoreFiles, includeFiles []string) (*c
 		return nil, err
 	}
 	graphIgnorePath := filepath.Join(absRepo, graphIgnoreFileName)
-	content, present, err := readBoundedRegularFile(
-		graphIgnorePath,
-		ignoreFileLabel(false),
-		false,
-		maxIgnoreFileBytes,
-	)
+	// The same no-follow reader loadPath uses for a repository-controlled ignore
+	// file. Without it a cache-enabled search follows a symlinked .graphignore
+	// that an uncached search refuses, so the two enforce different policies and
+	// the cached one echoes an outside file's lines through
+	// repo_ignored.sample[].rule as though the repository had written them. It is
+	// one call rather than a gate plus a separate read because two resolutions of
+	// the path are two different objects under a concurrent rename.
+	content, present, err := readRepoIgnoreFile(graphIgnorePath, ignoreFileLabel(false), false)
 	if err != nil {
 		return nil, err
 	}
@@ -217,26 +219,26 @@ func cachePolicyForOptions(absRepo string, options ProviderSnapshotOptions) (*ca
 func (policy *capturedIgnorePolicy) matcher() (ignoreMatcher, error) {
 	var matcher ignoreMatcher
 	if policy.graphIgnore.present {
-		if err := matcher.loadCaptured(policy.graphIgnore, false); err != nil {
+		if err := matcher.loadCaptured(policy.graphIgnore, false, graphIgnoreOrigin()); err != nil {
 			return ignoreMatcher{}, err
 		}
 	}
 	matcher.loadBuiltinSecretRules()
 	for _, input := range policy.ignoreFiles {
-		if err := matcher.loadCaptured(input, false); err != nil {
+		if err := matcher.loadCaptured(input, false, callerIgnoreOrigin(input.path)); err != nil {
 			return ignoreMatcher{}, err
 		}
 	}
 	for _, input := range policy.includeFiles {
-		if err := matcher.loadCaptured(input, true); err != nil {
+		if err := matcher.loadCaptured(input, true, callerIgnoreOrigin(input.path)); err != nil {
 			return ignoreMatcher{}, err
 		}
 	}
 	return matcher, nil
 }
 
-func (matcher *ignoreMatcher) loadCaptured(input capturedIgnoreFile, includeMode bool) error {
-	if err := matcher.loadReader(bytes.NewReader(input.content), includeMode); err != nil {
+func (matcher *ignoreMatcher) loadCaptured(input capturedIgnoreFile, includeMode bool, origin ignoreOrigin) error {
+	if err := matcher.loadReader(bytes.NewReader(input.content), includeMode, origin); err != nil {
 		return fmt.Errorf("read %s %q: %w", ignoreFileLabel(includeMode), input.path, err)
 	}
 	return nil

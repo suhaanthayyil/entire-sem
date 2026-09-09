@@ -19,7 +19,7 @@ func TestGitWorktreePreflightAllowsRootGitMetadataAndInvokesLister(t *testing.T)
 
 	calls := 0
 	paths, warnings, err := worktreeSourceFilesWithLister(
-		t.Context(), repo, ignoreMatcher{}, false,
+		t.Context(), repo, ignoreMatcher{}, false, nil,
 		func(ctx context.Context, repo string) ([]string, error) {
 			calls++
 			return gitutil.ListWorktreeFiles(ctx, repo)
@@ -55,7 +55,7 @@ func TestGitWorktreeListingFailuresThroughSymlinkedAncestorWarn(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
 		calls := 0
 		paths, warnings, err := worktreeSourceFilesWithLister(
-			t.Context(), repo, ignoreMatcher{}, false,
+			t.Context(), repo, ignoreMatcher{}, false, nil,
 			func(context.Context, string) ([]string, error) {
 				calls++
 				return nil, errors.New("worktree lister must not run after index failure")
@@ -78,7 +78,7 @@ func TestGitWorktreeListingFailuresThroughSymlinkedAncestorWarn(t *testing.T) {
 	t.Run("worktree listing", func(t *testing.T) {
 		calls := 0
 		paths, warnings, err := worktreeSourceFilesWithLister(
-			t.Context(), repo, ignoreMatcher{}, false,
+			t.Context(), repo, ignoreMatcher{}, false, nil,
 			func(context.Context, string) ([]string, error) {
 				calls++
 				return nil, errors.New("forced worktree listing failure")
@@ -109,7 +109,7 @@ func TestPlainDirectoryListingFailureThroughSymlinkedAncestorIsUnmarked(t *testi
 	t.Setenv("PATH", t.TempDir())
 
 	paths, warnings, err := worktreeSourceFilesWithLister(
-		t.Context(), repo, ignoreMatcher{}, false,
+		t.Context(), repo, ignoreMatcher{}, false, nil,
 		func(context.Context, string) ([]string, error) {
 			t.Fatal("worktree lister ran after index failure")
 			return nil, nil
@@ -164,7 +164,7 @@ func TestGitWorktreePreflightDeclinesNestedGitMarkerBeforeLister(t *testing.T) {
 
 	calls := 0
 	paths, warnings, err := worktreeSourceFilesWithLister(
-		t.Context(), repo, ignoreMatcher{}, false,
+		t.Context(), repo, ignoreMatcher{}, false, nil,
 		func(context.Context, string) ([]string, error) {
 			calls++
 			return nil, nil

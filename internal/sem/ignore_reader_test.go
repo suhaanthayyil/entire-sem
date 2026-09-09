@@ -20,7 +20,7 @@ func TestIgnoreSurfacesShareExactByteLimit(t *testing.T) {
 	}
 
 	var matcher ignoreMatcher
-	if err := matcher.loadRequired(ignore, false); err != nil {
+	if err := matcher.loadRequired(ignore, false, callerIgnoreOrigin("explicit-ignore")); err != nil {
 		t.Fatalf("loader rejected exact limit: %v", err)
 	}
 	options := ProviderSnapshotOptions{IgnoreFiles: []string{ignore}}
@@ -34,7 +34,7 @@ func TestIgnoreSurfacesShareExactByteLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	matcher = ignoreMatcher{}
-	if err := matcher.loadRequired(ignore, false); err == nil || !strings.Contains(err.Error(), "exceeds") {
+	if err := matcher.loadRequired(ignore, false, callerIgnoreOrigin("explicit-ignore")); err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("loader cap+1 error = %v", err)
 	}
 	for _, keyer := range ignoreInputKeyers(repo) {
@@ -56,7 +56,7 @@ func TestIgnoreSurfacesAllowSymlinkToRegularFile(t *testing.T) {
 	}
 
 	var matcher ignoreMatcher
-	if err := matcher.loadRequired(linked, false); err != nil {
+	if err := matcher.loadRequired(linked, false, callerIgnoreOrigin("explicit-ignore")); err != nil {
 		t.Fatalf("loader rejected regular symlink target: %v", err)
 	}
 	if !matcher.Ignored("vendor/pkg/file.go", false) {

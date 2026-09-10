@@ -1,0 +1,26 @@
+bundle:
+  name: entire-graph-risk
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog that stores risk history.
+    default: main
+  schema:
+    description: Unity Catalog schema that stores risk history.
+    default: entire_graph
+  risk_report_path:
+    description: Path to a JSON report produced by `entire graph risk --format json`.
+    default: ""
+  target_table:
+    description: Delta table name for normalized entity-level risk records.
+    default: changeset_risk
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      root_path: ~/.bundle/${bundle.name}/${bundle.target}

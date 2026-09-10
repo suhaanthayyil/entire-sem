@@ -14,7 +14,7 @@ import (
 var dispatchCommands = []string{
 	"diff", "commit", "checkpoint", "analyze", "doctor", "capabilities",
 	"snapshot", "snapshot-query", "symbols", "edges", "search", "index", "def",
-	"explain", "neighbors", "impact", "verify", "stats", "agent-guide",
+	"explain", "neighbors", "impact", "risk", "verify", "stats", "agent-guide",
 	"init-agents", "version", "help",
 }
 

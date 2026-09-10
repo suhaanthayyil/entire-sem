@@ -99,6 +99,8 @@ func Run(ctx context.Context, opts Options, args []string) error {
 		return runNeighbors(ctx, opts, args[1:])
 	case "impact":
 		return runImpact(ctx, opts, args[1:])
+	case "risk":
+		return runRisk(ctx, opts, args[1:])
 	case "verify":
 		return runVerify(ctx, opts, args[1:])
 	case "stats":

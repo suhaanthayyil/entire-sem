@@ -1,0 +1,20 @@
+resources:
+  jobs:
+    entire_graph_risk_ingestion:
+      name: "[${bundle.target}] entire-graph-risk-ingestion"
+      description: Normalizes JSON output from `entire graph risk` into a Unity Catalog Delta table.
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: ingest_risk_report
+          notebook_task:
+            notebook_path: ../src/ingest_risk_reports.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              target_table: ${var.target_table}
+              risk_report_path: ${var.risk_report_path}
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"

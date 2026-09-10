@@ -357,6 +357,23 @@ var commandDocs = []commandDoc{
 		examples: []string{"entire graph checkpoint abc123 --json"},
 	},
 	{
+		name:    "risk",
+		group:   groupAnalyze,
+		summary: "Classify a changeset's graph-derived risk and recommend tests",
+		usage:   []string{"entire graph risk [--base <rev> --head <rev> | --checkpoint <id>] [--format text|json] [--max-entities n] [--repo path]"},
+		long:    "Composes semantic diff and per-entity impact analysis into a bounded changeset risk report. Graph evidence (callers, type consumers, and locations) is printed separately from the deterministic risk inference. Test recommendations come only from graph caller and co-change paths and must be verified by running them.",
+		flags: []flagDoc{
+			{name: "--base", arg: "rev", def: "HEAD~1", desc: "Base revision"},
+			{name: "--head", arg: "rev", def: "HEAD", desc: "Head revision"},
+			{name: "--checkpoint", arg: "id", desc: "Analyze the semantic diff associated with an Entire checkpoint"},
+			{name: "--format", arg: "text|json", def: "text", desc: "Output format"},
+			{name: "--max-entities", arg: "n", def: "5", desc: "Maximum changed entities to impact-analyze"},
+			{name: "--profile", arg: "full|fast|syntax-only", def: "full", desc: "Graph snapshot profile"},
+			{name: "--repo", arg: "path", desc: "Repository (default: current repo)"},
+		},
+		examples: []string{"entire graph risk --repo . --base HEAD~1 --head HEAD", "entire graph risk --checkpoint abc123 --format json"},
+	},
+	{
 		name:    "verify",
 		group:   groupAnalyze,
 		summary: "Run a test command and return an adjudicated verdict, not test output",

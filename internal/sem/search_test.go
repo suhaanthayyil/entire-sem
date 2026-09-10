@@ -2211,7 +2211,7 @@ func TestSearchNameTermCoverageIsPluralTolerantAndSaturates(t *testing.T) {
 		t.Fatalf("gold name coverage %v must exceed single-term rival %v", g, r)
 	}
 	// "sections" (plural, from the issue) must match "Section" inside the identifier.
-	if !searchNameContainsTerm("pagemap.getpagesinsection", "sections") {
+	if !searchNameTokenMatchesTerm(searchTokenVariants("pageMap.getPagesInSection"), "sections") {
 		t.Fatal("plural query term must match the singular identifier")
 	}
 	// Saturation: a name carrying many terms is not unboundedly better than one carrying three.
@@ -2224,7 +2224,181 @@ func TestSearchNameTermCoverageIsPluralTolerantAndSaturates(t *testing.T) {
 		t.Fatalf("unrelated name must score 0, got %v", got)
 	}
 	// Short tokens must not match: a 2-char fragment appears in almost any identifier.
-	if searchNameContainsTerm("pagemap.getpagesinsection", "in") {
+	if searchNameTokenMatchesTerm(searchTokenVariants("pageMap.getPagesInSection"), "in") {
 		t.Fatal("short tokens must not count as name coverage")
+	}
+}
+
+// TestSearchNameCoverageExpandsProseAbbreviations pins the entireio/cli regression: the prose
+// sentence "the main authentication function that logs a user in" returned the LOGGING package,
+// because "authentication" matched no identifier while "logs" matched RestoreLogsOnly. The name a
+// developer writes is `auth`; the word a reporter writes is "authentication".
+func TestSearchNameCoverageExpandsProseAbbreviations(t *testing.T) {
+	t.Parallel()
+	q := buildSearchQuery("the main authentication function that logs a user in")
+	login := SearchResult{QualifiedName: "runLogin"}
+	authFlag := SearchResult{QualifiedName: "addInsecureHTTPAuthFlag"}
+	logs := SearchResult{QualifiedName: "ManualCommitStrategy.RestoreLogsOnly"}
+
+	// Before the abbreviation table this was 0: "authentication" matched no token of any auth
+	// identifier, so the one signal that exists to separate the head scored the correct answers
+	// exactly as low as unrelated code.
+	if got := searchNameTermCoverage(authFlag, q, nil); got == 0 {
+		t.Fatal("an identifier spelled with the abbreviation must score for the prose spelling")
+	}
+	// Deliberately >=, not >. Both names carry exactly one of this query's terms, so at the
+	// coverage layer they TIE; the table removes the auth side's zero, it does not by itself
+	// outrank logging. Ordering the full query is BM25's job and is covered end to end by the
+	// bench, not here — asserting > would be asserting something this function does not do.
+	if a, l := searchNameTermCoverage(authFlag, q, nil), searchNameTermCoverage(logs, q, nil); a < l {
+		t.Fatalf("auth identifier %v must not score below the logging identifier %v", a, l)
+	}
+	// runLogin scores, and the REASON is what this pins. It must match through "login" — the term
+	// compound joining recovers from the split phrasal verb — and must NOT match through "logs".
+	// Under the old substring test the situation was exactly inverted: there was no "login" term
+	// at all, and runLogin scored because plural-stripped "logs" was found inside "runlogin", the
+	// same accident that matched RestoreLogsOnly. Right answer, wrong reason, and a signal that
+	// could not separate the two clusters.
+	if got := searchNameTermCoverage(login, q, nil); got == 0 {
+		t.Fatal("runLogin must match the recovered login term")
+	}
+	loginTokens := searchTokenVariants("runLogin")
+	if !searchNameTokenMatchesTerm(loginTokens, "login") {
+		t.Fatal("runLogin must match through the joined compound")
+	}
+	if searchNameTokenMatchesTerm(loginTokens, "logs") {
+		t.Fatal("login must not match a logging term at token boundaries")
+	}
+	if !searchNameTokenMatchesTerm(searchTokenVariants("ManualCommitStrategy.RestoreLogsOnly"), "logs") {
+		t.Fatal("a genuine logging identifier must still match the logging term")
+	}
+	if searchNameMatchesAbbreviation(searchTokenVariants("runLogin"), "authentication") {
+		t.Fatal("the table must not have invented a login/authentication synonym")
+	}
+}
+
+// TestSearchNameMatchesAbbreviationIsTokenScoped guards the false positives that a raw substring
+// test would manufacture from short abbreviations.
+func TestSearchNameMatchesAbbreviationIsTokenScoped(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		term  string
+		ident string
+		want  bool
+	}{
+		{"long alias matches token prefix", "authentication", "runAuthenticated", true},
+		{"long alias matches exact token", "configuration", "loadConfig", true},
+		{"plural long form", "configurations", "loadConfig", true},
+		{"plural ies long form", "repositories", "openRepo", true},
+		{"long alias spans qualified name", "repository", "gitrepo.OpenCurrent", true},
+		{"short alias matches whole token", "context", "withCtx", true},
+		{"short alias matches whole token db", "database", "openDB", true},
+		{"short alias rejects substring", "request", "frequencyTable", false},
+		{"short alias rejects substring db", "database", "debugPrint", false},
+		{"short alias rejects substring int", "integer", "interfaceBuilder", false},
+		{"unmapped term never matches", "kubernetes", "kubeClient", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := searchNameMatchesAbbreviation(searchTokenVariants(tc.ident), tc.term)
+			if got != tc.want {
+				t.Fatalf("searchNameMatchesAbbreviation(%q, %q) = %v, want %v", tc.ident, tc.term, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSearchCompoundJoinSeparablePhrasalVerbs pins the entireio/cli regression. The motivating
+// sentence is "the main authentication function that logs a user in", where the phrasal verb is
+// split around its object: `logs` and `in` are four tokens apart, so an adjacent-pair scan sees
+// nothing. Before the joined term existed the query returned the LOGGING package with no auth in
+// the top five.
+func TestSearchCompoundJoinSeparablePhrasalVerbs(t *testing.T) {
+	t.Parallel()
+	q := buildSearchQuery("the main authentication function that logs a user in")
+	if !q.termSet["login"] {
+		t.Fatalf("separated phrasal verb must yield the joined term; got %v", q.terms)
+	}
+	// Added, never substituted: the split spelling has to survive for repos that use it.
+	if !q.termSet["logs"] && !q.termSet["log"] {
+		t.Fatalf("the split spelling must survive alongside the joined one; got %v", q.terms)
+	}
+}
+
+func TestSearchCompoundJoins(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		query string
+		want  string
+		found bool
+	}{
+		{"adjacent phrasal verb", "cannot log in", "login", true},
+		{"separated by determiner", "logs a user in", "login", true},
+		{"separated, possessive object", "log the user out", "logout", true},
+		{"inflected verb", "logging a user in", "login", true},
+		{"past tense", "logged the user in", "login", true},
+		{"adjacent noun compound", "the end point returns 404", "endpoint", true},
+		{"other phrasal verb", "roll the migration back", "rollback", true},
+		// The object-head requirement keeps an unrelated SEPARATED particle out: no determiner
+		// directly after "log", so the gap scan must not reach the trailing "in".
+		{"no object head, no separated join", "write every log entry in json", "login", false},
+		// noun + preposition, not a phrasal verb. The determiner in front of "log" marks it as a
+		// noun, which is the only cue English gives. Without this check the query returned
+		// persistLogin, RecordLoginContext and runLogin at ranks 1-3.
+		{"determiner marks a noun, not a phrasal verb", "write the log in json format", "login", false},
+		// ...but the same words with a verb in front are the phrasal verb, and must still join.
+		{"no determiner, still a phrasal verb", "the user cannot log in", "login", true},
+		{"logging an error as JSON", "log the error in json", "login", false},
+		{"logging a message as JSON", "log a message in json format", "login", false},
+		{"logging as YAML", "logs the response in YAML", "login", false},
+		{"logging as plain text", "log the message in plain text", "login", false},
+		{"adjacent formatting preposition", "write log in JSON", "login", false},
+		{"format with determiner", "log the message in a binary format", "login", false},
+		{"custom format", "log the message in custom format", "login", false},
+		{"formatting words elsewhere", "log the user in and return JSON", "login", true},
+		{"login location", "log the user in from the browser", "login", true},
+		{"check in binary files", "check in binary files", "checkin", true},
+		{"check in a JSON file", "check in a JSON file", "checkin", true},
+		{"checking a file format", "check the file in json format", "checkin", false},
+		{"signing a request format", "sign the request in json format", "signin", false},
+		{"checking YAML content", "check the response in YAML", "checkin", false},
+		{"signing a custom encoding", "sign the request in custom encoding", "signin", false},
+		{"separated check in", "check the file in and return JSON", "checkin", true},
+		{"separated sign in", "sign the user in and return JSON", "signin", true},
+		// Noun compounds are not separable; only the adjacent form counts.
+		{"noun compound is not separable", "the end of the point", "endpoint", false},
+		{"gap too wide", "logs every authenticated request payload in", "login", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := buildSearchQuery(tc.query).termSet[tc.want]
+			if got != tc.found {
+				t.Fatalf("buildSearchQuery(%q).termSet[%q] = %v, want %v", tc.query, tc.want, got, tc.found)
+			}
+		})
+	}
+}
+
+func TestSearchQueryAbbreviationsIncludeWordVariants(t *testing.T) {
+	t.Parallel()
+	for query, alias := range map[string]string{
+		"configurations": "config",
+		"repositories":   "repo",
+		"directories":    "dir",
+		"authenticating": "auth",
+	} {
+		t.Run(query, func(t *testing.T) {
+			q := buildSearchQuery(query)
+			if !q.termSet[alias] {
+				t.Fatalf("query %q must retrieve through %q; got %v", query, alias, q.terms)
+			}
+			if q.weights[alias] != searchAbbreviationTermWeight {
+				t.Fatalf("inferred alias weight = %v, want %v", q.weights[alias], searchAbbreviationTermWeight)
+			}
+		})
 	}
 }

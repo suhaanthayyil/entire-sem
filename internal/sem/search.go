@@ -3349,10 +3349,11 @@ func scoreSearchCandidates(candidates []searchCandidate, q searchQuery, fileDF m
 // Plural-tolerant on purpose: the issue says "sections" and the symbol says "Section", and an exact
 // substring test scores that as a miss — which is precisely how the gold site lost.
 func searchNameTermCoverage(result SearchResult, q searchQuery, _ map[string]float64) float64 {
-	name := strings.ToLower(result.QualifiedName)
-	if name == "" {
-		name = strings.ToLower(result.SymbolName)
+	rawName := result.QualifiedName
+	if rawName == "" {
+		rawName = result.SymbolName
 	}
+	name := strings.ToLower(rawName)
 	if name == "" || len(q.terms) == 0 {
 		return 0
 	}
@@ -3364,9 +3365,12 @@ func searchNameTermCoverage(result SearchResult, q searchQuery, _ map[string]flo
 	// (pages + section) barely above `Pages.Reverse` (pages). Counting DISTINCT matched terms is the
 	// signal: two domain terms in one name is strong evidence, three is decisive, and beyond that the
 	// extra matches say little, so it saturates.
+	// Tokenized once per candidate, not once per term: the abbreviation test is token-scoped and
+	// the split is the only expensive part of it.
+	tokens := searchTokenVariants(rawName)
 	matched := 0
 	for _, term := range q.terms {
-		if searchNameContainsTerm(name, term) {
+		if searchNameTokenMatchesTerm(tokens, term) || searchNameMatchesAbbreviation(tokens, term) {
 			matched++
 		}
 	}
@@ -3376,23 +3380,191 @@ func searchNameTermCoverage(result SearchResult, q searchQuery, _ map[string]flo
 	return minFloat64(float64(matched), 3) / 3
 }
 
-// searchNameContainsTerm matches a query term against an identifier, tolerating the one
-// morphological difference that dominates issue text: a plural in the prose against a singular in
-// the identifier ("sections" vs getPagesInSection).
-func searchNameContainsTerm(lowerName, term string) bool {
+// searchNameTokenMatchesTerm matches a query term against the TOKENS of an identifier, tolerating
+// the one morphological difference that dominates issue text: a plural in the prose against a
+// singular in the identifier ("sections" vs getPagesInSection).
+//
+// This replaced a raw substring test over the lowercased name, which could not tell login from
+// logging. `strings.Contains("runlogin", "log")` is true, so the plural-stripped term "logs" from
+// "the function that logs a user in" matched runLogin and RestoreLogsOnly identically — the one
+// signal that could have separated the two clusters scored them the same. Tokenizing first makes
+// "log" a match for the token "logs" and a non-match for the token "login", which is the
+// distinction the substring form structurally could not express.
+//
+// The cost is derivational prefixes: "config" no longer matches the token "configure", where the
+// substring form did. That is deliberate. The abbreviation path is where prefix reach belongs,
+// because it knows WHICH short forms are real (searchNameMatchesAbbreviation), and applying prefix
+// reach to every query term is precisely what produced the login/logging collision.
+func searchNameTokenMatchesTerm(tokens []string, term string) bool {
 	if len(term) < 3 {
 		return false
 	}
-	if strings.Contains(lowerName, term) {
-		return true
-	}
-	if strings.HasSuffix(term, "es") && len(term) > 4 && strings.Contains(lowerName, term[:len(term)-2]) {
-		return true
-	}
-	if strings.HasSuffix(term, "s") && len(term) > 3 && strings.Contains(lowerName, term[:len(term)-1]) {
-		return true
+	termVariants := searchNameWordVariants(term)
+	for _, token := range tokens {
+		for _, tokenVariant := range searchNameWordVariants(token) {
+			for _, termVariant := range termVariants {
+				if tokenVariant == termVariant {
+					return true
+				}
+			}
+		}
 	}
 	return false
+}
+
+// searchNameWordVariants returns the singular forms a word might be matched through. Both sides of
+// the comparison are expanded rather than one, because the query is as likely to carry the plural
+// as the identifier is: "sections" against Section, and "file" against files.
+//
+// Every candidate form is emitted rather than one chosen by rule, since the rules disagree — "-es"
+// stripping is right for "processes" and wrong for "files".
+func searchNameWordVariants(word string) []string {
+	out := []string{word}
+	if strings.HasSuffix(word, "ies") && len(word) > 4 {
+		out = append(out, word[:len(word)-3]+"y")
+	}
+	if strings.HasSuffix(word, "es") && len(word) > 4 {
+		out = append(out, word[:len(word)-2])
+	}
+	if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 3 {
+		out = append(out, word[:len(word)-1])
+	}
+	return out
+}
+
+// searchAbbreviationTermWeight is the query weight of an alias the caller did not type. It matches
+// the morphological-variant weight: same class of inference, same confidence.
+const searchAbbreviationTermWeight = 0.55
+
+// searchTermAbbreviations maps the long, prose spelling of a concept to the short spellings an
+// identifier actually uses. Prose and code disagree systematically here, and searchNameContainsTerm
+// tolerates only the plural: it is a substring test, so "authentication" scores a MISS against
+// runLogin, persistLogin and the whole `auth` package.
+//
+// Measured on entireio/cli. The query "authentication" topped out at 16.6 (rank 1
+// addInsecureHTTPAuthFlag, then slugifyTitle and HTTPErrorMessage — noise); the same concept spelled
+// the way the code spells it, "auth", scored 34.6 with a clean auth-only head. So the prose sentence
+// "the main authentication function that logs a user in" returned the LOGGING package —
+// RestoreLogsOnly and handleLogsOnlyRewindNonInteractive at 22.3 — because "logs" is spelled the way
+// code spells it and "authentication" is not. The name-coverage signal that exists to separate the
+// head scored zero on every correct answer.
+//
+// One direction only, long -> short. Query terms come from prose and identifiers carry the
+// abbreviation; the reverse is already handled, since "auth" is a substring of runAuthenticated.
+var searchTermAbbreviations = map[string][]string{
+	"address":        {"addr"},
+	"administration": {"admin"},
+	"administrator":  {"admin"},
+	"allocate":       {"alloc"},
+	"allocation":     {"alloc"},
+	"argument":       {"arg"},
+	"asynchronous":   {"async"},
+	"attribute":      {"attr"},
+	"authenticate":   {"auth"},
+	"authenticated":  {"auth"},
+	"authentication": {"auth"},
+	"authorization":  {"authz", "auth"},
+	"authorize":      {"authz", "auth"},
+	"boolean":        {"bool"},
+	"buffer":         {"buf"},
+	"calculate":      {"calc"},
+	"calculation":    {"calc"},
+	"command":        {"cmd"},
+	"configuration":  {"config", "cfg"},
+	"configure":      {"config"},
+	"connection":     {"conn"},
+	"context":        {"ctx"},
+	"database":       {"db"},
+	"declaration":    {"decl"},
+	"definition":     {"def"},
+	"delete":         {"del"},
+	"destination":    {"dest", "dst"},
+	"directory":      {"dir"},
+	"document":       {"doc"},
+	"documentation":  {"docs", "doc"},
+	"environment":    {"env"},
+	"error":          {"err"},
+	"executable":     {"exec"},
+	"execute":        {"exec"},
+	"expression":     {"expr"},
+	"identifier":     {"id"},
+	"implementation": {"impl"},
+	"information":    {"info"},
+	"initialization": {"init"},
+	"initialize":     {"init"},
+	"integer":        {"int"},
+	"iterator":       {"iter"},
+	"length":         {"len"},
+	"library":        {"lib"},
+	"maximum":        {"max"},
+	"message":        {"msg"},
+	"minimum":        {"min"},
+	"number":         {"num"},
+	"package":        {"pkg"},
+	"parameter":      {"param"},
+	"parameters":     {"params"},
+	"pointer":        {"ptr"},
+	"previous":       {"prev"},
+	"property":       {"prop"},
+	"reference":      {"ref"},
+	"repository":     {"repo"},
+	"request":        {"req"},
+	"response":       {"resp"},
+	"session":        {"sess"},
+	"source":         {"src"},
+	"specification":  {"spec"},
+	"statement":      {"stmt"},
+	"statistics":     {"stats"},
+	"synchronize":    {"sync"},
+	"synchronous":    {"sync"},
+	"temporary":      {"temp", "tmp"},
+	"transaction":    {"txn"},
+	"utility":        {"util"},
+}
+
+// searchNameMatchesAbbreviation reports whether any abbreviation of term appears as a TOKEN of the
+// identifier. Token-scoped on purpose: searchNameContainsTerm can afford a raw substring because a
+// query term is a whole word, but an abbreviation is short enough that substring matching
+// manufactures hits — "int" for "integer" would match interface, internal and print.
+//
+// Two thresholds, because the risk is length-dependent. Four characters and up may match a token
+// PREFIX OR SUFFIX, which is what carries auth -> Authenticated, config -> Configured and, at the
+// suffix end, repo -> gitrepo and auth -> oauth: package-qualified names routinely glue the
+// abbreviation onto the tail of a token. Anchoring at both ends rather than allowing a free
+// substring is what keeps spec -> inspect out, since "inspect" ends in "spect". Two and three
+// characters must match a whole token, which stops req -> frequency and db -> debug while still
+// catching the standalone ctx, req, err and db that code writes as their own token.
+//
+// Known and accepted: auth also prefixes "author", so an authentication query picks up commitAuthor
+// in a VCS codebase. Name coverage saturates at three distinct terms and is one component of the
+// score, so a single spurious term costs a third of one signal — cheap next to scoring every
+// correct answer at zero.
+func searchNameMatchesAbbreviation(tokens []string, term string) bool {
+	aliases := searchAbbreviations(term)
+	for _, alias := range aliases {
+		for _, token := range tokens {
+			if len(alias) >= 4 {
+				if strings.HasPrefix(token, alias) || strings.HasSuffix(token, alias) {
+					return true
+				}
+				continue
+			}
+			if token == alias {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Use the same plural variants for retrieval and name coverage, including -ies
+// spellings such as repositories -> repository -> repo.
+func searchAbbreviations(term string) []string {
+	var aliases []string
+	for _, variant := range searchNameWordVariants(term) {
+		aliases = appendUnique(aliases, searchTermAbbreviations[variant]...)
+	}
+	return aliases
 }
 
 // searchNameCoverageWeight is how much a fully name-covering candidate gains. Sized against the
@@ -4700,6 +4872,190 @@ func regionsAroundHits(hits []int, lower, upper, context, maxLines int) [][2]int
 	return regions
 }
 
+// searchCompoundPhrases maps a two-word prose spelling to the single identifier code uses for it.
+// Keyed on the BASE form of the first word; searchCompoundJoin handles the inflections.
+//
+// Two kinds of entry. Phrasal verbs ("log in", "roll back") are the ones prose almost always
+// splits and code almost never does. Noun compounds ("end point", "meta data") are the ones prose
+// splits inconsistently. Both lose the joined token today.
+var searchCompoundPhrases = map[string]string{
+	"back up":      "backup",
+	"black list":   "blacklist",
+	"break down":   "breakdown",
+	"call back":    "callback",
+	"check in":     "checkin",
+	"check out":    "checkout",
+	"clean up":     "cleanup",
+	"data base":    "database",
+	"drop down":    "dropdown",
+	"end point":    "endpoint",
+	"fall back":    "fallback",
+	"fall through": "fallthrough",
+	"hand off":     "handoff",
+	"life cycle":   "lifecycle",
+	"log in":       "login",
+	"log out":      "logout",
+	"look up":      "lookup",
+	"meta data":    "metadata",
+	"name space":   "namespace",
+	"place holder": "placeholder",
+	"roll back":    "rollback",
+	"roll out":     "rollout",
+	"run time":     "runtime",
+	"set up":       "setup",
+	"shut down":    "shutdown",
+	"sign in":      "signin",
+	"sign out":     "signout",
+	"sign up":      "signup",
+	"start up":     "startup",
+	"tear down":    "teardown",
+	"time out":     "timeout",
+	"time stamp":   "timestamp",
+	"warm up":      "warmup",
+	"web hook":     "webhook",
+	"white list":   "whitelist",
+	"work around":  "workaround",
+	"work flow":    "workflow",
+}
+
+// searchPhrasalVerbParticles are the second halves of the SEPARABLE entries in the table above.
+// English splits a phrasal verb around its object — "logs A USER in", "roll THE CHANGE back" — so
+// an adjacent-pair scan never sees the pair at all. This was the first version of this fix and it
+// changed nothing on the very query that motivated it, because the motivating sentence is "the
+// authentication function that logs a user in": `logs` and `in` are four tokens apart.
+//
+// Noun compounds ("end point", "meta data") are NOT separable and stay adjacent-only.
+var searchPhrasalVerbParticles = map[string]bool{
+	"back":    true,
+	"down":    true,
+	"in":      true,
+	"off":     true,
+	"out":     true,
+	"through": true,
+	"up":      true,
+}
+
+// searchCompoundObjectHeads are the words that can open the object a phrasal verb splits around.
+// Requiring one is what separates "logs a user in" from "write the log in JSON": the first has a
+// determiner immediately after the verb, the second does not.
+var searchCompoundObjectHeads = map[string]bool{
+	"a": true, "an": true, "the": true, "this": true, "that": true, "these": true, "those": true,
+	"its": true, "their": true, "his": true, "her": true, "our": true, "my": true, "your": true,
+	"it": true, "them": true, "him": true, "us": true, "me": true, "you": true,
+}
+
+// searchMaxCompoundGap is how many tokens may sit between a phrasal verb and its particle. Three
+// covers the object phrases that actually occur ("logs a user in", "roll the failed change back")
+// without letting the scan reach across a clause boundary.
+const searchMaxCompoundGap = 3
+
+// searchCompoundDeterminers mark the following word as a NOUN. This is the cue that separates the
+// phrasal verb "cannot log in" from the noun-plus-preposition "write THE log in json format" —
+// two token sequences English spells identically and distinguishes only by part of speech.
+//
+// Without this check the false positive is not a rounding error: "write the log in json format"
+// returned persistLogin, RecordLoginContext and runLogin at ranks 1-3, hijacking a legitimate
+// logging query outright. Measured, after an earlier version of this comment claimed the cost was
+// bounded because the joined term is only ADDED. It is not bounded; an added term that matches a
+// dense cluster of real identifiers wins.
+//
+// Applied to phrasal verbs only. Noun compounds ("the end point", "the meta data") are nouns
+// already and a determiner in front of them is expected, not disqualifying.
+var searchCompoundDeterminers = map[string]bool{
+	"a": true, "an": true, "the": true, "this": true, "that": true, "these": true, "those": true,
+	"my": true, "your": true, "his": true, "her": true, "its": true, "our": true, "their": true,
+	"each": true, "every": true, "any": true, "some": true, "no": true, "one": true,
+}
+
+// searchCompoundJoins returns the single-identifier spellings implied by the token at index: the
+// adjacent pair, plus — for a separable phrasal verb — the particle found a few tokens later.
+func searchCompoundJoins(tokens []string, index int) []string {
+	var out []string
+	if index+1 < len(tokens) {
+		particle := searchPhrasalVerbParticles[strings.ToLower(tokens[index+1])]
+		nounPhrase := index > 0 && searchCompoundDeterminers[strings.ToLower(tokens[index-1])]
+		if !(particle && nounPhrase) {
+			if joined, ok := searchCompoundJoin(tokens[index], tokens[index+1]); ok &&
+				(joined != "login" || !searchCompoundFormatPreposition(tokens, index+1)) {
+				out = append(out, joined)
+			}
+		}
+	}
+	for gap := 2; gap <= searchMaxCompoundGap+1 && index+gap < len(tokens); gap++ {
+		particle := strings.ToLower(tokens[index+gap])
+		if !searchPhrasalVerbParticles[particle] {
+			continue
+		}
+		// The object has to look like an object. Without this, any "log" and any later "in"
+		// in the same sentence would manufacture a login term.
+		if !searchCompoundObjectHeads[strings.ToLower(tokens[index+1])] {
+			continue
+		}
+		// Here the verb already has its object before "in", so a following
+		// format describes that object for any verb ("sign the request in JSON").
+		// Adjacent "check in a JSON file" instead places the object after "in".
+		if joined, ok := searchCompoundJoin(tokens[index], particle); ok &&
+			!searchCompoundFormatPreposition(tokens, index+gap) {
+			out = append(out, joined)
+		}
+	}
+	return out
+}
+
+// In "log a message in JSON", "in" introduces the output format rather than
+// completing "log in". Inspect only the immediately following noun phrase so
+// "log the user in and return JSON" still recovers login.
+func searchCompoundFormatPreposition(tokens []string, index int) bool {
+	if strings.ToLower(tokens[index]) != "in" {
+		return false
+	}
+	next := index + 1
+	if next < len(tokens) && searchCompoundDeterminers[strings.ToLower(tokens[next])] {
+		next++
+	}
+	if next >= len(tokens) {
+		return false
+	}
+	switch strings.ToLower(tokens[next]) {
+	case "json", "yaml", "yml", "xml", "csv", "tsv", "text", "plaintext",
+		"html", "toml", "ini", "binary", "hex", "hexadecimal", "base64",
+		"protobuf", "msgpack", "messagepack":
+		return true
+	case "plain":
+		return next+1 < len(tokens) && strings.EqualFold(tokens[next+1], "text")
+	}
+	return next+1 < len(tokens) && (strings.EqualFold(tokens[next+1], "format") || strings.EqualFold(tokens[next+1], "encoding"))
+}
+
+// searchCompoundJoin reports the single-identifier spelling of a word pair, if there is one. The
+// first word is matched on its base form as well as its literal one, because the sentence a
+// reporter writes conjugates the verb the table cannot: "logs in", "logged in" and "logging in"
+// all mean login, and only "log in" is in the table.
+func searchCompoundJoin(first, second string) (string, bool) {
+	head := strings.ToLower(first)
+	tail := strings.ToLower(second)
+	if joined, ok := searchCompoundPhrases[head+" "+tail]; ok {
+		return joined, true
+	}
+	for _, suffix := range []string{"ing", "ed", "es", "s"} {
+		if !strings.HasSuffix(head, suffix) || len(head) <= len(suffix)+1 {
+			continue
+		}
+		stem := head[:len(head)-len(suffix)]
+		if joined, ok := searchCompoundPhrases[stem+" "+tail]; ok {
+			return joined, true
+		}
+		// English doubles the final consonant before -ing/-ed, so "logging" stems to "logg" and
+		// "logg in" is in no table. Collapse the double and try once more.
+		if n := len(stem); n >= 2 && stem[n-1] == stem[n-2] {
+			if joined, ok := searchCompoundPhrases[stem[:n-1]+" "+tail]; ok {
+				return joined, true
+			}
+		}
+	}
+	return "", false
+}
+
 func buildSearchQuery(query string) searchQuery {
 	// Strip before anything reads the text, so terms, words and rawLower are all derived from
 	// the same URL-state-free query. SearchResponse.Query still echoes the caller's original.
@@ -4755,6 +5111,22 @@ func buildSearchQuery(query string) searchQuery {
 			add(term, weight)
 		}
 	}
+	// Prose splits compounds that code writes as one identifier, and the split throws away the
+	// most informative token in the query. `search` is documented to take "the task or bug in one
+	// plain sentence", and English writes this verb as two words: "the authentication function
+	// that logs a user IN". Measured on entireio/cli, that sentence returned the LOGGING package
+	// (RestoreLogsOnly, handleLogsOnlyRewindNonInteractive) with no auth in the top five, while the
+	// same sentence carrying `login` as one token returned fetchCurrentUserLogin, persistLogin,
+	// RecordLoginContext and NewRefreshingLoginProvider — every hit auth, logging gone.
+	//
+	// ADDED, never substituted. "logs" and "log" stay in the query: a repo is free to spell the
+	// concept as two words in prose, a doc comment or a test name, and dropping the split form to
+	// chase the joined one would trade this blind spot for its mirror image.
+	for index := range rawTokens {
+		for _, joined := range searchCompoundJoins(rawTokens, index) {
+			add(joined, 1.0)
+		}
+	}
 	for _, entity := range constraints.Entities {
 		add(entity.Normalized, 1.0)
 	}
@@ -4770,6 +5142,34 @@ func buildSearchQuery(query string) searchQuery {
 	for _, term := range originalTerms {
 		for _, related := range morphologicalSearchTerms(term) {
 			add(related, 0.55)
+		}
+	}
+	// Abbreviations have to enter the query as TERMS, not only as a name-coverage rule.
+	//
+	// searchNameMatchesAbbreviation re-ranks: it can lift a candidate the retrieval stage already
+	// produced, and it can do nothing at all for one that stage never produced. The offline eval
+	// caught the difference. On a fixture where the identifier is the only bridge from
+	// "authentication" to the auth cluster, the query returns runLogin alone — newAuthCmd never
+	// enters the candidate pool, so there is nothing for the name rule to boost. That is also why
+	// entireio/cli improved only 16.6 -> 19.9 on "authentication" rather than reaching the 34.6
+	// that "auth" scores: those candidates were already in the pool via path and body matches, and
+	// the name rule merely reordered them.
+	//
+	// Adding the alias here puts it in front of preselection and BM25, so the auth files are
+	// RETRIEVED for a query that never says "auth".
+	//
+	// Weighted like a morphological variant rather than like a typed term: an abbreviation is
+	// strong evidence of the same concept but it is still the caller's word inferred, not written,
+	// and a full-weight alias would let an inferred term outrank one the caller actually chose.
+	// Snapshot after morphology, before adding aliases: inferred singular and
+	// verb forms must participate too, without recursively expanding aliases.
+	abbreviationTerms := make([]string, 0, len(weights))
+	for term := range weights {
+		abbreviationTerms = append(abbreviationTerms, term)
+	}
+	for _, term := range abbreviationTerms {
+		for _, alias := range searchAbbreviations(term) {
+			add(alias, searchAbbreviationTermWeight)
 		}
 	}
 	termSet := make(map[string]bool, len(weights))
